@@ -328,166 +328,275 @@ class Composer:
     # ---- composition -----------------------------------------------------
 
     def compose(self):
+        self._plan_sections()
         self._baseline()
         self._beat_layer()
+        self._climax_choreography()
         self._drop_layer()
         self._interior_layer()
 
+    def _plan_sections(self):
+        """Compute the narrative arc: intro / build / climax / outro.
+
+        Tesla shows follow a dramatic structure — start quiet, build light
+        activity, culminate with physical movement (trunk/mirrors/doors),
+        then wind down. We always schedule the physical-movement moment
+        during the `climax` window, at the loudest sustained 2 s we can
+        find in that window. This guarantees closures fire even for songs
+        without a classic EDM drop.
+        """
+        import numpy as np  # analyze_audio already requires this
+        n = self.n
+        self.intro_end = int(n * 0.15)
+        self.build_end = int(n * 0.55)
+        self.climax_end = int(n * 0.85)
+        # climax window: build_end .. climax_end
+        # Find loudest sustained 2 s chunk inside it
+        win = ms_to_frames(2000, self.STEP_MS)
+        rms = np.asarray(self.rms, dtype=np.float32)
+        best = self.build_end + (self.climax_end - self.build_end) // 2
+        if self.climax_end - self.build_end > win:
+            # simple boxcar
+            kernel = np.ones(win, dtype=np.float32) / win
+            smooth = np.convolve(rms, kernel, mode="same")
+            seg = smooth[self.build_end : self.climax_end]
+            best = self.build_end + int(np.argmax(seg))
+        self.climax_peak = best  # single dramatic moment in the climax
+
+    def _section(self, f: int) -> str:
+        if f < self.intro_end:
+            return "intro"
+        if f < self.build_end:
+            return "build"
+        if f < self.climax_end:
+            return "climax"
+        return "outro"
+
+    def _section_intensity(self, f: int) -> float:
+        """Multiplier 0..1 that scales how intense the beat layer is."""
+        s = self._section(f)
+        if s == "intro":
+            # ramps 0.2 → 0.5
+            return 0.2 + 0.3 * (f / max(1, self.intro_end))
+        if s == "build":
+            # ramps 0.5 → 0.9
+            frac = (f - self.intro_end) / max(1, self.build_end - self.intro_end)
+            return 0.5 + 0.4 * frac
+        if s == "climax":
+            return 1.0
+        # outro — calm down 0.9 → 0.2
+        frac = (f - self.climax_end) / max(1, self.n - self.climax_end)
+        return 0.9 - 0.7 * frac
+
     def _baseline(self):
-        """Gentle breathing on main beams tied to bass envelope."""
+        """Gentle breathing on main beams tied to bass envelope, scaled by section."""
         for f in range(self.n):
             b = self.bass[f]
-            if b > 0.3:
-                val = int(clamp(b * 255, 0, 255))
+            gate = self._section_intensity(f)
+            if b * gate > 0.25:
+                val = int(clamp(b * 255 * gate, 0, 255))
                 self.w.set(f, CH["L_INNER_BEAM"], val)
                 self.w.set(f, CH["R_INNER_BEAM"], val)
 
     def _beat_layer(self):
-        """On-beat punches alternating left/right, with kick/snare differentiation."""
+        """On-beat punches, modulated by the narrative arc.
+
+        * intro: sparse; only ~every 4th beat, ramping not instant
+        * build: every 2nd beat; mix of ramps and pulses
+        * climax: every beat, full intensity, kick/snare differentiated
+        * outro: every 4th beat, very soft ramps only
+        """
         alt = 0
-        for beat in self.beats:
+        for idx, beat in enumerate(self.beats):
             if beat >= self.n:
                 break
+            section = self._section(beat)
             strong = beat in self.strong
             rms = self.rms[min(len(self.rms) - 1, beat)]
             bass_here = self.bass[min(len(self.bass) - 1, beat)]
             mid_here = self.mid[min(len(self.mid) - 1, beat)]
 
-            if strong or rms > 0.6:
-                # Kick (bass-heavy) → main beams + front turn + brake
-                if bass_here >= mid_here:
-                    self.all_front_flash(beat, hold_ms=80 if self.model in ("model_3", "model_y") else 60)
-                    self.pulse(CH["L_FRONT_TURN"], beat, hold_ms=100)
-                    self.pulse(CH["R_FRONT_TURN"], beat, hold_ms=100)
-                    self.rear_beat(beat, hold_ms=120)
+            # skip-rate per section
+            if section == "intro" and (idx % 4) != 0:
+                continue
+            if section == "outro" and (idx % 4) != 0:
+                continue
+            if section == "build" and (idx % 2) != 0 and not strong:
+                continue
+
+            if section == "intro":
+                # soft, sparse ramp-pulse alternating sides
+                if alt % 2 == 0:
+                    self.ramp_pulse(CH["L_INNER_BEAM"], beat, "1000", hold_ms=600)
                 else:
-                    # Snare (mid-heavy) → signature + channel 4-6 + rear turn
-                    self.pulse(CH["L_SIGNATURE"], beat, hold_ms=100)
-                    self.pulse(CH["R_SIGNATURE"], beat, hold_ms=100)
-                    for c in ("L_CH4", "R_CH4", "L_CH5", "R_CH5"):
-                        self.pulse(CH[c], beat, hold_ms=80)
-                    self.pulse(CH["L_REAR_TURN"], beat, hold_ms=80)
-                    self.pulse(CH["R_REAR_TURN"], beat, hold_ms=80)
-                    # Model X has rear fog even in NA — extra rear accent
-                    if self.model == "model_x":
-                        self.pulse(CH["REAR_FOG"], beat, hold_ms=80)
+                    self.ramp_pulse(CH["R_INNER_BEAM"], beat, "1000", hold_ms=600)
+            elif section == "outro":
+                # fade the whole car down — long ramps
+                self.ramp_pulse(CH["L_INNER_BEAM"], beat, "2000", hold_ms=1500)
+                self.ramp_pulse(CH["R_INNER_BEAM"], beat, "2000", hold_ms=1500)
             else:
-                # Soft beat: alternate side beam with a brief ramp
-                if self.model in ("model_3", "model_y"):
-                    if alt % 2 == 0:
-                        self.ramp_pulse(CH["L_OUTER_BEAM"], beat, "500", hold_ms=260)
-                        self.ramp_pulse(CH["L_INNER_BEAM"], beat, "500", hold_ms=260)
+                # build / climax — full beat logic
+                heavy = strong or rms > (0.5 if section == "build" else 0.4)
+                if heavy:
+                    if bass_here >= mid_here:
+                        self.all_front_flash(
+                            beat, hold_ms=80 if self.model in ("model_3", "model_y") else 60
+                        )
+                        self.pulse(CH["L_FRONT_TURN"], beat, hold_ms=100)
+                        self.pulse(CH["R_FRONT_TURN"], beat, hold_ms=100)
+                        self.rear_beat(beat, hold_ms=120)
                     else:
-                        self.ramp_pulse(CH["R_OUTER_BEAM"], beat, "500", hold_ms=260)
-                        self.ramp_pulse(CH["R_INNER_BEAM"], beat, "500", hold_ms=260)
+                        self.pulse(CH["L_SIGNATURE"], beat, hold_ms=100)
+                        self.pulse(CH["R_SIGNATURE"], beat, hold_ms=100)
+                        for c in ("L_CH4", "R_CH4", "L_CH5", "R_CH5"):
+                            self.pulse(CH[c], beat, hold_ms=80)
+                        self.pulse(CH["L_REAR_TURN"], beat, hold_ms=80)
+                        self.pulse(CH["R_REAR_TURN"], beat, hold_ms=80)
+                        if self.model == "model_x":
+                            self.pulse(CH["REAR_FOG"], beat, hold_ms=80)
                 else:
-                    self.alternating_beam(beat, left=(alt % 2 == 0), hold_ms=100)
-                # Rhythm guitar sparkle on off-beats
-                if self.rng.random() < 0.4:
-                    self.sparkle_high(beat + ms_to_frames(120))
+                    if self.model in ("model_3", "model_y"):
+                        if alt % 2 == 0:
+                            self.ramp_pulse(CH["L_OUTER_BEAM"], beat, "500", hold_ms=260)
+                            self.ramp_pulse(CH["L_INNER_BEAM"], beat, "500", hold_ms=260)
+                        else:
+                            self.ramp_pulse(CH["R_OUTER_BEAM"], beat, "500", hold_ms=260)
+                            self.ramp_pulse(CH["R_INNER_BEAM"], beat, "500", hold_ms=260)
+                    else:
+                        self.alternating_beam(beat, left=(alt % 2 == 0), hold_ms=100)
+                    if self.rng.random() < 0.4 and section != "intro":
+                        self.sparkle_high(beat + ms_to_frames(120))
             alt += 1
 
-        # High-band onset hats sparkle between beats
-        for f in range(self.n):
+        # High-band onset hats sparkle — only in build/climax
+        for f in range(self.intro_end, self.climax_end):
             if self.high[f] > 0.7 and self.onset[f] > 0.5:
                 if self.rng.random() < 0.15:
                     self.sparkle_high(f)
 
+    def _climax_choreography(self):
+        """Guaranteed physical-movement climax — fires once regardless of
+        whether audio-analysis found a "drop". This is the trunk/mirror/
+        door reveal that Tesla shows are known for.
+        """
+        d = self.climax_peak
+
+        # Liftgate / Frunk opens ~14 s before the peak
+        pre_open = d - ms_to_frames(14_000, self.STEP_MS)
+        if pre_open < self.intro_end:
+            # not enough runway — open as early as we can and shift peak
+            pre_open = max(0, self.intro_end)
+        self.closure(CH["LIFTGATE"], pre_open, "open", hold_ms=300,
+                     budget_key="liftgate", limit=5)
+
+        # Charge port dance through a 10 s window starting at peak
+        cp_pre = d - ms_to_frames(2500, self.STEP_MS)
+        if cp_pre >= 0:
+            self.closure(CH["CHARGE_PORT"], cp_pre, "open", hold_ms=300,
+                         budget_key="charge_port", limit=2)
+        dance_end = min(self.n, d + ms_to_frames(10_000, self.STEP_MS))
+        self.w.set_range(d, dance_end, CH["CHARGE_PORT"], CLOSURE["dance"])
+
+        # Mirror flap: 3× open/close alternating sides around the peak
+        # (6 actuations total per mirror, well inside the 20 limit).
+        # Start 1.5 s before peak, 600 ms between moves.
+        mir_start = d - ms_to_frames(1500, self.STEP_MS)
+        step = ms_to_frames(600, self.STEP_MS)
+        for i in range(3):
+            t = mir_start + i * 2 * step
+            if t < 0:
+                continue
+            self.closure(CH["L_MIRROR"], t, "open", hold_ms=200,
+                         budget_key="mirrors", limit=18)
+            self.closure(CH["R_MIRROR"], t + step // 2, "open", hold_ms=200,
+                         budget_key="mirrors", limit=18)
+            self.closure(CH["L_MIRROR"], t + step, "close", hold_ms=200,
+                         budget_key="mirrors", limit=18)
+            self.closure(CH["R_MIRROR"], t + step + step // 2, "close", hold_ms=200,
+                         budget_key="mirrors", limit=18)
+
+        # Model S: door handles pop at the peak
+        if self.model == "model_s":
+            for c in (CH["L_FRONT_HANDLE"], CH["R_FRONT_HANDLE"],
+                      CH["L_REAR_HANDLE"], CH["R_REAR_HANDLE"]):
+                self.closure(c, d - ms_to_frames(1200), "open", hold_ms=200,
+                             budget_key="door_handles", limit=18)
+                self.closure(c, d + ms_to_frames(1500), "close", hold_ms=200,
+                             budget_key="door_handles", limit=18)
+
+        # Model X: full falcon + front-door reveal at the peak
+        if self.model == "model_x":
+            fd_open = d - ms_to_frames(25_000, self.STEP_MS)
+            if fd_open < 0:
+                fd_open = 0
+            self.closure(CH["L_FALCON"], fd_open, "open",
+                         hold_ms=200, budget_key="falcon_doors", limit=5)
+            self.closure(CH["R_FALCON"], fd_open + ms_to_frames(200), "open",
+                         hold_ms=200, budget_key="falcon_doors", limit=5)
+            self.closure(CH["L_FRONT_DOOR"], fd_open, "open",
+                         hold_ms=200, budget_key="front_doors", limit=5)
+            self.closure(CH["R_FRONT_DOOR"], fd_open + ms_to_frames(200), "open",
+                         hold_ms=200, budget_key="front_doors", limit=5)
+            falcon_dance_end = min(self.n, d + ms_to_frames(6000, self.STEP_MS))
+            self.w.set_range(d, falcon_dance_end, CH["L_FALCON"], CLOSURE["dance"])
+            self.w.set_range(d, falcon_dance_end, CH["R_FALCON"], CLOSURE["dance"])
+            close_doors = min(self.n - 1, d + ms_to_frames(7_000, self.STEP_MS))
+            self.closure(CH["L_FRONT_DOOR"], close_doors, "close",
+                         hold_ms=200, budget_key="front_doors", limit=5)
+            self.closure(CH["R_FRONT_DOOR"], close_doors + ms_to_frames(200), "close",
+                         hold_ms=200, budget_key="front_doors", limit=5)
+            close_falcon = min(self.n - 1, falcon_dance_end + ms_to_frames(500, self.STEP_MS))
+            self.closure(CH["L_FALCON"], close_falcon, "close",
+                         hold_ms=200, budget_key="falcon_doors", limit=5)
+            self.closure(CH["R_FALCON"], close_falcon + ms_to_frames(200), "close",
+                         hold_ms=200, budget_key="falcon_doors", limit=5)
+
+        # Big visual blast at the peak — all front lights full, 400 ms
+        blast_end = d + ms_to_frames(400, self.STEP_MS)
+        for f in range(d, min(self.n, blast_end)):
+            for c in [CH["L_OUTER_BEAM"], CH["R_OUTER_BEAM"],
+                      CH["L_INNER_BEAM"], CH["R_INNER_BEAM"],
+                      CH["L_SIGNATURE"], CH["R_SIGNATURE"],
+                      CH["L_CH4"], CH["R_CH4"], CH["L_CH5"], CH["R_CH5"],
+                      CH["L_CH6"], CH["R_CH6"],
+                      CH["L_FRONT_TURN"], CH["R_FRONT_TURN"],
+                      CH["L_FRONT_FOG"], CH["R_FRONT_FOG"],
+                      CH["BRAKE"], CH["L_TAIL"], CH["R_TAIL"], CH["REVERSE"]]:
+                self.w.set(f, c, 255)
+
+        # Cybertruck: dramatic light-bar sweep across the peak
+        if self.model == "cybertruck":
+            self.cybertruck_lightbar_sweep(
+                d, d + ms_to_frames(6000, self.STEP_MS), style="curtain"
+            )
+
+        # Close the liftgate late in the climax so it's back down for outro.
+        close_gate = min(self.n - 1, self.climax_end - ms_to_frames(4000, self.STEP_MS))
+        self.closure(CH["LIFTGATE"], close_gate, "close", hold_ms=300,
+                     budget_key="liftgate", limit=5)
+
     def _drop_layer(self):
-        """Closure choreography around detected loudness jumps."""
-        # Charge port dance through the whole chorus sections
-        # Place Dance when we hit the drop and hold until energy fades
-        for i, d in enumerate(self.drops):
-            # schedule closures: open liftgate/frunk ~14 s before drop
-            pre_open = d - ms_to_frames(14_000, self.STEP_MS)
-            if pre_open >= 0:
-                self.closure(CH["LIFTGATE"], pre_open, "open", hold_ms=200,
-                             budget_key="liftgate", limit=5)
-            # Charge port dance over 6-12 seconds starting at drop
-            dance_end = min(self.n, d + ms_to_frames(12_000, self.STEP_MS))
-            # Open charge port 2.5 s before so dance registers
-            pre = d - ms_to_frames(2500, self.STEP_MS)
-            if pre >= 0:
-                self.closure(CH["CHARGE_PORT"], pre, "open", hold_ms=200,
-                             budget_key="charge_port", limit=2)
-            self.w.set_range(d, dance_end, CH["CHARGE_PORT"], CLOSURE["dance"])
-
-            # Mirror wave: open-close left then right just before the drop
-            mir = d - ms_to_frames(2000, self.STEP_MS)
-            self.closure(CH["L_MIRROR"], mir, "open", hold_ms=100,
-                         budget_key="mirrors", limit=18)
-            self.closure(CH["R_MIRROR"], mir + ms_to_frames(200), "open", hold_ms=100,
-                         budget_key="mirrors", limit=18)
-            self.closure(CH["L_MIRROR"], mir + ms_to_frames(1500), "close", hold_ms=100,
-                         budget_key="mirrors", limit=18)
-            self.closure(CH["R_MIRROR"], mir + ms_to_frames(1700), "close", hold_ms=100,
-                         budget_key="mirrors", limit=18)
-
-            # Model X: schedule falcon + front doors to open ~25 s before a
-            # big drop, then Close ~1 s after the drop hits for a dramatic
-            # opening/closing sequence.  Falcon doors support Dance (rare
-            # and very cool); front doors do not.
-            if self.model == "model_x":
-                fd_open = d - ms_to_frames(25_000, self.STEP_MS)
-                if fd_open >= 0:
-                    self.closure(CH["L_FALCON"], fd_open, "open",
-                                 hold_ms=200, budget_key="falcon_doors", limit=5)
-                    self.closure(CH["R_FALCON"], fd_open + ms_to_frames(200), "open",
-                                 hold_ms=200, budget_key="falcon_doors", limit=5)
-                    self.closure(CH["L_FRONT_DOOR"], fd_open, "open",
-                                 hold_ms=200, budget_key="front_doors", limit=5)
-                    self.closure(CH["R_FRONT_DOOR"], fd_open + ms_to_frames(200), "open",
-                                 hold_ms=200, budget_key="front_doors", limit=5)
-                # Dance the falcon doors through the first ~6 s of chorus
-                # (falcon doors support Dance; front doors do not).
-                falcon_dance_end = min(self.n, d + ms_to_frames(6000, self.STEP_MS))
-                self.w.set_range(d, falcon_dance_end, CH["L_FALCON"], CLOSURE["dance"])
-                self.w.set_range(d, falcon_dance_end, CH["R_FALCON"], CLOSURE["dance"])
-                # Close front doors about 6 s after the drop (they're quick — 3 s close)
-                close_doors = min(self.n - 1, d + ms_to_frames(6_000, self.STEP_MS))
-                self.closure(CH["L_FRONT_DOOR"], close_doors, "close",
-                             hold_ms=200, budget_key="front_doors", limit=5)
-                self.closure(CH["R_FRONT_DOOR"], close_doors + ms_to_frames(200), "close",
-                             hold_ms=200, budget_key="front_doors", limit=5)
-                # Close falcon doors shortly after their dance finishes
-                close_falcon = min(self.n - 1, falcon_dance_end + ms_to_frames(500, self.STEP_MS))
-                self.closure(CH["L_FALCON"], close_falcon, "close",
-                             hold_ms=200, budget_key="falcon_doors", limit=5)
-                self.closure(CH["R_FALCON"], close_falcon + ms_to_frames(200), "close",
-                             hold_ms=200, budget_key="falcon_doors", limit=5)
-
-            # Model S: door handles pop just before the drop
-            if self.model == "model_s":
-                for c in (CH["L_FRONT_HANDLE"], CH["R_FRONT_HANDLE"], CH["L_REAR_HANDLE"], CH["R_REAR_HANDLE"]):
-                    self.closure(c, d - ms_to_frames(1200), "open", hold_ms=200,
-                                 budget_key="door_handles", limit=18)
-                    self.closure(c, d + ms_to_frames(500), "close", hold_ms=200,
-                                 budget_key="door_handles", limit=18)
-
-            # After the drop, the liftgate closes during the hold then
-            # re-opens if there's another drop soon.
-            close_at = min(self.n - 1, d + ms_to_frames(12_000, self.STEP_MS))
-            self.closure(CH["LIFTGATE"], close_at, "close", hold_ms=200,
-                         budget_key="liftgate", limit=5)
-
-            # Big visual: full-front blast synced to drop
-            blast_end = d + ms_to_frames(400, self.STEP_MS)
+        """Decorate additional audio-detected drops (if any) — but only as
+        secondary moments, not a second climax. Keeps closures off these
+        so the real climax stays the headline.
+        """
+        for d in self.drops:
+            # skip if this drop coincides with the climax (within 3 s)
+            if abs(d - self.climax_peak) < ms_to_frames(3000, self.STEP_MS):
+                continue
+            # Only decorate drops inside build/climax sections
+            if d < self.intro_end or d > self.climax_end:
+                continue
+            # Mini-blast on the front lights (shorter than the climax blast)
+            blast_end = d + ms_to_frames(250, self.STEP_MS)
             for f in range(d, min(self.n, blast_end)):
                 for c in [CH["L_OUTER_BEAM"], CH["R_OUTER_BEAM"],
                           CH["L_INNER_BEAM"], CH["R_INNER_BEAM"],
-                          CH["L_SIGNATURE"], CH["R_SIGNATURE"],
-                          CH["L_CH4"], CH["R_CH4"], CH["L_CH5"], CH["R_CH5"],
-                          CH["L_CH6"], CH["R_CH6"],
-                          CH["L_FRONT_TURN"], CH["R_FRONT_TURN"],
-                          CH["L_FRONT_FOG"], CH["R_FRONT_FOG"],
-                          CH["BRAKE"], CH["L_TAIL"], CH["R_TAIL"], CH["REVERSE"]]:
+                          CH["BRAKE"], CH["L_TAIL"], CH["R_TAIL"]]:
                     self.w.set(f, c, 255)
-
-            # Cybertruck: full-light-bar sweep across the drop
             if self.model == "cybertruck":
                 self.cybertruck_lightbar_sweep(
-                    d, d + ms_to_frames(6000, self.STEP_MS),
-                    style="curtain",
+                    d, d + ms_to_frames(2000, self.STEP_MS), style="chase"
                 )
 
     def _interior_layer(self):
