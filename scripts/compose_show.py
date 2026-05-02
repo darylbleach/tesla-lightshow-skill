@@ -330,6 +330,8 @@ class Composer:
     def compose(self):
         self._plan_sections()
         self._baseline()
+        self._blinker_layer()
+        self._marker_sparkle_layer()
         self._beat_layer()
         self._climax_choreography()
         self._drop_layer()
@@ -389,14 +391,100 @@ class Composer:
         return 0.9 - 0.7 * frac
 
     def _baseline(self):
-        """Gentle breathing on main beams tied to bass envelope, scaled by section."""
-        for f in range(self.n):
-            b = self.bass[f]
-            gate = self._section_intensity(f)
-            if b * gate > 0.25:
-                val = int(clamp(b * 255 * gate, 0, 255))
-                self.w.set(f, CH["L_INNER_BEAM"], val)
-                self.w.set(f, CH["R_INNER_BEAM"], val)
+        """Intentionally empty — previous always-on inner-beam glow was washing
+        out the show. Reference shows keep the car mostly dark with bright
+        bursts; contrast is everything."""
+        return
+
+    def _blinker_layer(self):
+        """Signature Tesla-show pattern: alternating L/R yellow turn signals
+        running through musical subdivisions. This is the "yellow blinker"
+        effect the user wanted more of.
+
+        Strategy: between each pair of detected beats, fire a 2-pulse or
+        4-pulse alternating blink pattern using the front turn signals
+        (and rear turn if snare-heavy). Rate: build → climax only.
+        """
+        if len(self.beats) < 2:
+            return
+        for i in range(len(self.beats) - 1):
+            b0 = self.beats[i]
+            b1 = self.beats[i + 1]
+            if b0 >= self.n or b1 >= self.n:
+                break
+            section = self._section(b0)
+            if section == "intro":
+                continue
+            # Subdivision count per beat: intro 0, build 2, climax 4, outro 0
+            subdivs = {"build": 2, "climax": 4, "outro": 0}.get(section, 0)
+            if subdivs == 0:
+                continue
+            beat_len = b1 - b0
+            if beat_len < ms_to_frames(100, self.STEP_MS):
+                continue
+            sub_len = beat_len // subdivs
+            on_hold = max(2, int(sub_len * 0.55))  # 55% of subdiv is ON
+            for s in range(subdivs):
+                t = b0 + s * sub_len
+                if t >= self.n:
+                    break
+                use_left = (s % 2 == 0)
+                front_ch = CH["L_FRONT_TURN"] if use_left else CH["R_FRONT_TURN"]
+                rear_ch = CH["L_REAR_TURN"] if use_left else CH["R_REAR_TURN"]
+                self.w.set_range(t, t + on_hold, front_ch, 255)
+                # rear turn only in climax (busier = more drama)
+                if section == "climax":
+                    self.w.set_range(t, t + on_hold, rear_ch, 255)
+                # Cybertruck has full-brightness rear turn — ramp it with envelope
+                if self.model == "cybertruck" and section == "climax":
+                    env = self.rms[min(len(self.rms) - 1, t)]
+                    lvl = int(128 + 127 * env)
+                    self.w.set_range(t, t + on_hold, rear_ch, lvl)
+
+    def _marker_sparkle_layer(self):
+        """Constant sparkle on side markers, side repeaters, and license
+        plate whenever high-band energy spikes. Reference shows keep these
+        alive ~12% of the time.
+        """
+        # Walk frames, fire a short sparkle at high-band onsets
+        min_gap = ms_to_frames(220, self.STEP_MS)
+        last_fire = -min_gap * 2
+        alt = 0
+        for f in range(self.intro_end, self.climax_end):
+            if f - last_fire < min_gap:
+                continue
+            # Trigger threshold falls off in intro, rises in climax
+            section = self._section(f)
+            if section == "build":
+                thresh = 0.55
+            elif section == "climax":
+                thresh = 0.35
+            else:
+                thresh = 1.1  # never
+            if self.high[f] < thresh and self.onset[f] < thresh:
+                continue
+            # Pick a pattern: alternate LEFT-side, RIGHT-side, or BOTH
+            pattern = alt % 3
+            hold_ms = 100 if section == "climax" else 70
+            hold_frames = ms_to_frames(hold_ms, self.STEP_MS)
+            left = [CH["L_SIDE_MARKER"], CH["L_SIDE_REPEATER"]]
+            right = [CH["R_SIDE_MARKER"], CH["R_SIDE_REPEATER"]]
+            if pattern == 0:
+                for c in left:
+                    self.w.set_range(f, f + hold_frames, c, 255)
+            elif pattern == 1:
+                for c in right:
+                    self.w.set_range(f, f + hold_frames, c, 255)
+            else:
+                for c in left + right:
+                    self.w.set_range(f, f + hold_frames, c, 255)
+                # Big sparkle: also the license plate + aux park (CT: frunk)
+                if section == "climax":
+                    self.w.set_range(f, f + hold_frames, CH["LICENSE"], 255)
+                    self.w.set_range(f, f + hold_frames, CH["L_AUX_PARK"], 255)
+                    self.w.set_range(f, f + hold_frames, CH["R_AUX_PARK"], 255)
+            last_fire = f
+            alt += 1
 
     def _beat_layer(self):
         """On-beat punches, modulated by the narrative arc.
@@ -425,43 +513,55 @@ class Composer:
                 continue
 
             if section == "intro":
-                # soft, sparse ramp-pulse alternating sides
+                # soft, sparse ramp-pulse alternating sides (outer beam only —
+                # keeps inner beams reserved for big beats)
                 if alt % 2 == 0:
-                    self.ramp_pulse(CH["L_INNER_BEAM"], beat, "1000", hold_ms=600)
+                    self.ramp_pulse(CH["L_OUTER_BEAM"], beat, "1000", hold_ms=600)
                 else:
-                    self.ramp_pulse(CH["R_INNER_BEAM"], beat, "1000", hold_ms=600)
+                    self.ramp_pulse(CH["R_OUTER_BEAM"], beat, "1000", hold_ms=600)
             elif section == "outro":
-                # fade the whole car down — long ramps
-                self.ramp_pulse(CH["L_INNER_BEAM"], beat, "2000", hold_ms=1500)
-                self.ramp_pulse(CH["R_INNER_BEAM"], beat, "2000", hold_ms=1500)
+                # fade the whole car down — long ramps on outer beams only
+                self.ramp_pulse(CH["L_OUTER_BEAM"], beat, "2000", hold_ms=1500)
+                self.ramp_pulse(CH["R_OUTER_BEAM"], beat, "2000", hold_ms=1500)
             else:
                 # build / climax — full beat logic
                 heavy = strong or rms > (0.5 if section == "build" else 0.4)
                 if heavy:
                     if bass_here >= mid_here:
+                        # Kick: all fronts + both turn signals + rear
                         self.all_front_flash(
                             beat, hold_ms=80 if self.model in ("model_3", "model_y") else 60
                         )
-                        self.pulse(CH["L_FRONT_TURN"], beat, hold_ms=100)
-                        self.pulse(CH["R_FRONT_TURN"], beat, hold_ms=100)
+                        self.pulse(CH["L_FRONT_TURN"], beat, hold_ms=120)
+                        self.pulse(CH["R_FRONT_TURN"], beat, hold_ms=120)
+                        # Also fire all Ch4-6 simultaneously for density
+                        for c in ("L_CH4", "R_CH4", "L_CH5", "R_CH5", "L_CH6", "R_CH6"):
+                            self.pulse(CH[c], beat, hold_ms=80)
                         self.rear_beat(beat, hold_ms=120)
+                        # License + reverse add rear density on climax kicks
+                        if section == "climax":
+                            self.pulse(CH["LICENSE"], beat, hold_ms=120)
+                            self.pulse(CH["REVERSE"], beat, hold_ms=120)
                     else:
+                        # Snare: signature + channels 4-6 + rear turn + fog
                         self.pulse(CH["L_SIGNATURE"], beat, hold_ms=100)
                         self.pulse(CH["R_SIGNATURE"], beat, hold_ms=100)
-                        for c in ("L_CH4", "R_CH4", "L_CH5", "R_CH5"):
+                        for c in ("L_CH4", "R_CH4", "L_CH5", "R_CH5", "L_CH6", "R_CH6"):
                             self.pulse(CH[c], beat, hold_ms=80)
-                        self.pulse(CH["L_REAR_TURN"], beat, hold_ms=80)
-                        self.pulse(CH["R_REAR_TURN"], beat, hold_ms=80)
+                        self.pulse(CH["L_REAR_TURN"], beat, hold_ms=100)
+                        self.pulse(CH["R_REAR_TURN"], beat, hold_ms=100)
+                        # Fog adds visual weight on snare (not on CT — no fog)
+                        if self.model != "cybertruck":
+                            self.pulse(CH["L_FRONT_FOG"], beat, hold_ms=80)
+                            self.pulse(CH["R_FRONT_FOG"], beat, hold_ms=80)
                         if self.model == "model_x":
-                            self.pulse(CH["REAR_FOG"], beat, hold_ms=80)
+                            self.pulse(CH["REAR_FOG"], beat, hold_ms=100)
                 else:
+                    # Soft beat: short alternating OUTER beam hit (keep
+                    # inner beams mostly dark so heavy beats pop)
                     if self.model in ("model_3", "model_y"):
-                        if alt % 2 == 0:
-                            self.ramp_pulse(CH["L_OUTER_BEAM"], beat, "500", hold_ms=260)
-                            self.ramp_pulse(CH["L_INNER_BEAM"], beat, "500", hold_ms=260)
-                        else:
-                            self.ramp_pulse(CH["R_OUTER_BEAM"], beat, "500", hold_ms=260)
-                            self.ramp_pulse(CH["R_INNER_BEAM"], beat, "500", hold_ms=260)
+                        ch_use = CH["L_OUTER_BEAM"] if alt % 2 == 0 else CH["R_OUTER_BEAM"]
+                        self.ramp_pulse(ch_use, beat, "500", hold_ms=200)
                     else:
                         self.alternating_beam(beat, left=(alt % 2 == 0), hold_ms=100)
                     if self.rng.random() < 0.4 and section != "intro":
