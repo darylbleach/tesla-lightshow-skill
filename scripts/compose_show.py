@@ -618,7 +618,12 @@ class Composer:
                         if self.model != "cybertruck":
                             self.pulse(CH["L_FRONT_FOG"], beat, hold_ms=80)
                             self.pulse(CH["R_FRONT_FOG"], beat, hold_ms=80)
-                        if self.model == "model_x":
+                        # Rear fog: Model X has it in NA; on 3/S/Y it only
+                        # exists outside North America. Sending the command
+                        # on a car that lacks it is harmless (the firmware
+                        # just ignores the channel), so we fire it on every
+                        # non-CT car and trust the hardware to filter.
+                        if self.model != "cybertruck":
                             self.pulse(CH["REAR_FOG"], beat, hold_ms=100)
                 else:
                     # Soft beat: short alternating OUTER beam hit (keep
@@ -645,13 +650,39 @@ class Composer:
         """
         d = self.climax_peak
 
-        # Liftgate / Frunk opens ~14 s before the peak
+        # Liftgate / Frunk opens ~14 s before the peak so it's fully open
+        # when the climax hits (liftgate takes ~14 s to open).
         pre_open = d - ms_to_frames(14_000, self.STEP_MS)
         if pre_open < self.intro_end:
             # not enough runway — open as early as we can and shift peak
             pre_open = max(0, self.intro_end)
         self.closure(CH["LIFTGATE"], pre_open, "open", hold_ms=300,
                      budget_key="liftgate", limit=5)
+
+        # Liftgate Dance: 2-3 short dance bursts clustered around the peak.
+        # Dance only works when the liftgate is already open (14 s after
+        # pre_open, matching how long it takes to fully open). Each dance
+        # burst counts as one actuation against the 6-actuation budget,
+        # so we do 3 bursts (+ the open + the close = 5 total, under 6).
+        # Each burst is ~1.2 s long. Gap between bursts ~1.5 s.
+        dance_first = d - ms_to_frames(1000, self.STEP_MS)
+        if dance_first < pre_open + ms_to_frames(14_000, self.STEP_MS):
+            # force it to land after the gate is physically open
+            dance_first = pre_open + ms_to_frames(14_500, self.STEP_MS)
+        burst_len = ms_to_frames(1200, self.STEP_MS)
+        burst_gap = ms_to_frames(1500, self.STEP_MS)
+        for i in range(3):
+            t = dance_first + i * (burst_len + burst_gap)
+            end = t + burst_len
+            if end >= self.n:
+                break
+            # One Dance actuation = one contiguous run of byte=128 in the
+            # stream, so we set the range to DANCE then explicitly IDLE after.
+            self.w.set_range(t, end, CH["LIFTGATE"], CLOSURE["dance"])
+            self.closure_used["liftgate"] = self.closure_used.get("liftgate", 0) + 1
+            # idle between bursts so the next dance is a fresh actuation
+            self.w.set_range(end, end + ms_to_frames(200, self.STEP_MS),
+                             CH["LIFTGATE"], CLOSURE["idle"])
 
         # Charge port dance through a 10 s window starting at peak
         cp_pre = d - ms_to_frames(2500, self.STEP_MS)
@@ -661,23 +692,30 @@ class Composer:
         dance_end = min(self.n, d + ms_to_frames(10_000, self.STEP_MS))
         self.w.set_range(d, dance_end, CH["CHARGE_PORT"], CLOSURE["dance"])
 
-        # Mirror flap: 3× open/close alternating sides around the peak
-        # (6 actuations total per mirror, well inside the 20 limit).
-        # Start 1.5 s before peak, 600 ms between moves.
-        mir_start = d - ms_to_frames(1500, self.STEP_MS)
-        step = ms_to_frames(600, self.STEP_MS)
-        for i in range(3):
-            t = mir_start + i * 2 * step
-            if t < 0:
-                continue
+        # Mirror flap: reference-style continuous ~18 s wiper pattern.
+        # 9 open/close cycles × 2 mirrors = 18 actuations per mirror (mirrors
+        # have a 20-actuation budget). Cycle period ~2 s (close → open → close
+        # fits within the 2 s actuation time). Start 9 s before the peak so
+        # the flapping is already in full swing when the peak hits and keeps
+        # going for ~9 s after.
+        flap_count = 9
+        flap_period = ms_to_frames(2000, self.STEP_MS)
+        mir_start = d - ms_to_frames(9000, self.STEP_MS)
+        if mir_start < 0:
+            mir_start = 0
+        for i in range(flap_count):
+            t = mir_start + i * flap_period
+            if t + flap_period >= self.n:
+                break
+            # On each cycle, open both mirrors then close both
             self.closure(CH["L_MIRROR"], t, "open", hold_ms=200,
-                         budget_key="mirrors", limit=18)
-            self.closure(CH["R_MIRROR"], t + step // 2, "open", hold_ms=200,
-                         budget_key="mirrors", limit=18)
-            self.closure(CH["L_MIRROR"], t + step, "close", hold_ms=200,
-                         budget_key="mirrors", limit=18)
-            self.closure(CH["R_MIRROR"], t + step + step // 2, "close", hold_ms=200,
-                         budget_key="mirrors", limit=18)
+                         budget_key="mirrors", limit=19)
+            self.closure(CH["R_MIRROR"], t + ms_to_frames(100, self.STEP_MS),
+                         "open", hold_ms=200, budget_key="mirrors", limit=19)
+            self.closure(CH["L_MIRROR"], t + flap_period // 2, "close", hold_ms=200,
+                         budget_key="mirrors", limit=19)
+            self.closure(CH["R_MIRROR"], t + flap_period // 2 + ms_to_frames(100, self.STEP_MS),
+                         "close", hold_ms=200, budget_key="mirrors", limit=19)
 
         # Model S: door handles pop at the peak
         if self.model == "model_s":
