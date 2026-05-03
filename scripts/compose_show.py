@@ -461,20 +461,27 @@ class Composer:
             section = self._section(b0)
             if section == "intro":
                 continue
-            # Subdivision count per beat: intro 0, build 2, climax 4, outro 0
-            subdivs = {"build": 2, "climax": 4, "outro": 0}.get(section, 0)
+            # Subdivision count per beat: intro 0, build 1 (on-beat only),
+            # climax 3 (three blinks per beat). Previously build=2 and
+            # climax=4 was too constant and washed out contrast.
+            subdivs = {"build": 1, "climax": 2, "outro": 0}.get(section, 0)
             if subdivs == 0:
                 continue
             beat_len = b1 - b0
             if beat_len < ms_to_frames(100, self.STEP_MS):
                 continue
             sub_len = beat_len // subdivs
-            on_hold = max(2, int(sub_len * 0.55))  # 55% of subdiv is ON
+            # 22% of the subdivision is ON. Reference coffin-dance has turn
+            # signals at ~9% duty cycle — this targets roughly that when
+            # subdivs=1 (build) or higher when subdivs=2 (climax).
+            on_hold = max(2, int(sub_len * 0.22))
             for s in range(subdivs):
                 t = b0 + s * sub_len
                 if t >= self.n:
                     break
-                use_left = (s % 2 == 0)
+                # Alternate across both beats and subdivisions so build mode
+                # (1 blink per beat) still flips L/R between beats.
+                use_left = ((i + s) % 2 == 0)
                 front_ch = CH["L_FRONT_TURN"] if use_left else CH["R_FRONT_TURN"]
                 rear_ch = CH["L_REAR_TURN"] if use_left else CH["R_REAR_TURN"]
                 self.w.set_range(t, t + on_hold, front_ch, 255)
@@ -495,7 +502,10 @@ class Composer:
         follows the actual stereo position of the high-frequency content
         in the mix (hi-hats panned right -> right-side sparkle, etc).
         """
-        min_gap = ms_to_frames(320, self.STEP_MS)
+        # Min gap raised from 320 ms → 500 ms and thresholds raised so the
+        # sparkle layer leaves more silence between hits (reference has
+        # markers on ~12% of frames, we were hitting 16%).
+        min_gap = ms_to_frames(500, self.STEP_MS)
         last_fire = -min_gap * 2
         alt = 0
         for f in range(self.intro_end, self.climax_end):
@@ -503,9 +513,9 @@ class Composer:
                 continue
             section = self._section(f)
             if section == "build":
-                thresh = 0.65
+                thresh = 0.75
             elif section == "climax":
-                thresh = 0.5
+                thresh = 0.6
             else:
                 thresh = 1.1
             if self.high[f] < thresh and self.onset[f] < thresh:
@@ -627,13 +637,18 @@ class Composer:
                             self.pulse(CH["REAR_FOG"], beat, hold_ms=100)
                 else:
                     # Soft beat: short alternating OUTER beam hit (keep
-                    # inner beams mostly dark so heavy beats pop)
-                    if self.model in ("model_3", "model_y"):
-                        ch_use = CH["L_OUTER_BEAM"] if alt % 2 == 0 else CH["R_OUTER_BEAM"]
-                        self.ramp_pulse(ch_use, beat, "500", hold_ms=200)
-                    else:
-                        self.alternating_beam(beat, left=(alt % 2 == 0), hold_ms=100)
-                    if self.rng.random() < 0.4 and section != "intro":
+                    # inner beams mostly dark so heavy beats pop). Only
+                    # fire every other soft beat to preserve contrast.
+                    if alt % 2 == 0:
+                        # Instant pulse instead of a ramp so the outer beam
+                        # contributes crisp short hits rather than long
+                        # on-time between beats (was washing the car out).
+                        if self.model in ("model_3", "model_y"):
+                            ch_use = CH["L_OUTER_BEAM"] if (alt // 2) % 2 == 0 else CH["R_OUTER_BEAM"]
+                            self.pulse(ch_use, beat, hold_ms=60, level=255)
+                        else:
+                            self.alternating_beam(beat, left=((alt // 2) % 2 == 0), hold_ms=60)
+                    if self.rng.random() < 0.25 and section != "intro":
                         self.sparkle_high(beat + ms_to_frames(120))
             alt += 1
 
