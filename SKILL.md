@@ -48,11 +48,41 @@ Work in the project directory. The scripts live in this skill's `scripts/` folde
 python3 skill/scripts/analyze_audio.py <path/to/song.wav> /tmp/<basename>.json
 ```
 
-This writes a JSON timeline sampled at 20 ms with:
-- `rms`, `bass`, `low_mid`, `mid`, `high`, `onset`, `brightness` (0..1 arrays)
-- `beat_frames` and `strong_beat_frames` (downbeats)
-- `drop_frames` (loudness-jump moments — use for big reveals)
-- `tempo_bpm`
+This writes a JSON timeline sampled at 20 ms. The analyzer is
+**stereo-aware** — it preserves L/R all the way through the FFT and
+extracts features that depend on the stereo field (panning, width,
+mid/side). That lets the composer do things like "fire the right-side
+markers because the hi-hats are panned right in this bar".
+
+Features emitted (all arrays are 0..1 unless noted; one value per 20 ms frame):
+
+- **Energy**: `rms`, `bass` (20–200 Hz), `low_mid` (200–800), `mid` (800–3200), `high` (3200+), `mel[32]` (log-spaced)
+- **Mid/Side**: `mid_energy` (center of the mix), `side_energy` (stereo/ambience), `stereo_width` (0 = mono, 1 = fully wide)
+- **Panning** (−1 = hard left, +1 = hard right): `pan_bass`, `pan_mid`, `pan_high`, `pan_overall`
+- **HPSS**: `perc_rms`, `perc_onset` (drum/hat-only onset), `harm_rms` (chords/vocals)
+- **Broadband**: `onset`, `brightness`
+- **Structure**: `beat_frames`, `strong_beat_frames`, `drop_frames`, `tempo_bpm`
+- **Metadata**: `analyzer` = `"librosa"` or `"numpy-stereo"`
+
+#### Optional: librosa for better beat tracking
+
+The analyzer auto-detects **librosa** at import time and uses its
+Ellis-style beat tracker when available. Pure numpy is the fallback.
+Librosa gives noticeably better beat tracking on:
+
+- Slow / non-percussive music (anthems, ballads, classical)
+- Songs with tempo changes
+- Syncopated rhythms
+
+To install:
+
+```bash
+pip3 install librosa
+```
+
+It's free (ISC license, MIT-equivalent) and pulls in ~80 MB of
+scientific Python. Everything else in the pipeline still works
+without it — the output just uses the simpler built-in tracker.
 
 ### Step 2 — compose the show
 
@@ -120,13 +150,16 @@ Tell the user:
 
 Full tables are in `references/channel_map.md` and `references/model_capabilities.md`. Quick reference for composition:
 
-- **Kick / bass-heavy beats** → Main beams (outer + inner), front turn signals, brake lights, Cybertruck bed lights.
-- **Snare / mid-heavy beats** → Signature, Channels 4-6, rear turn signals, tail lights.
-- **Hi-hats / high-band onsets** → Side markers, side repeaters, fog (on non-CT), license plate — use sparsely for sparkle.
+- **Kick / bass-heavy beats** (detected via `perc_onset` + `bass >= mid`) → Main beams (outer + inner), front turn signals, all Ch4-6 simultaneously, brake lights, Cybertruck bed lights. On climax kicks also: license + reverse.
+- **Snare / mid-heavy beats** → Signature, Channels 4-6, rear turn signals, front fog (non-CT), tail lights. Model X adds rear fog.
+- **Hi-hats / high-band onsets** → Side markers + side repeaters. **Stereo-aware**: `pan_high < -0.15` → left side only; `> +0.15` → right side only; near-center → both. Both-side in climax also lights license + aux park.
+- **Stereo opening moments** — jumps in `side_energy` or `stereo_width` above a 3 s baseline → brief fog + aux park wash (mimics a reverb tail or strings spreading out).
 - **Sustained loudness (RMS)** → Interior RGB wash (CT only in 200-ch), Cybertruck light bar brightness envelope.
-- **Drops** → Pre-open liftgate ~14 s before, **Falcon Doors ~25 s before and Front Doors ~25 s before on Model X**, charge port Dance through the chorus (rainbow), mirror wave 2 s before, full-front blast at the drop, light-bar curtain sweep on Cybertruck.
-- **Brightness / spectral centroid** → Hue mapping for RGB (warm when dark, cool when bright).
-- **Alternating Left/Right on soft beats** to build stereo motion.
+- **Climax peak** (guaranteed — loudest sustained 2 s in 55–85% of track, independent of drop detection) → Liftgate opens 14 s before, mirror 3-flap, charge port Dance (rainbow), full-front blast, model-specific reveal (S door handles / X falcon + front doors).
+- **Audio-detected drops outside climax** → Mini front-light blast, no closures (stays subordinate to the climax).
+- **Brightness / spectral centroid** → Hue mapping for interior RGB (warm when dark, cool when bright).
+- **Yellow blinker layer** — front turn signals alternate L↔R on 2× beat subdivisions in build, 4× in climax (the signature "yellow blinker" pattern).
+- **Narrative arc** — intro (0–15%) soft outer-beam ramps only; build (15–55%) every-other-beat; climax (55–85%) full density; outro (85–100%) long 2 s breathing ramps.
 - Use ramping variants (70/80/90%) on Model 3 / Y / Cybertruck where smooth fades read better than boolean snaps.
 
 ## Model-specific reminders

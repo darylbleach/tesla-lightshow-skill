@@ -157,6 +157,18 @@ class Composer:
         self.high = analysis["high"]
         self.onset = analysis["onset"]
         self.brightness = analysis["brightness"]
+        # New stereo-aware features (added in the stereo analyzer pass).
+        # Older analysis JSON files might not have them; fall back gracefully.
+        n = analysis["n_frames"]
+        self.pan_bass = analysis.get("pan_bass", [0.0] * n)
+        self.pan_mid = analysis.get("pan_mid", [0.0] * n)
+        self.pan_high = analysis.get("pan_high", [0.0] * n)
+        self.pan_overall = analysis.get("pan_overall", [0.0] * n)
+        self.stereo_width = analysis.get("stereo_width", [0.0] * n)
+        self.side_energy = analysis.get("side_energy", [0.0] * n)
+        self.perc_onset = analysis.get("perc_onset", analysis.get("onset", [0.0] * n))
+        self.perc_rms = analysis.get("perc_rms", analysis.get("rms", [0.0] * n))
+        self.harm_rms = analysis.get("harm_rms", analysis.get("rms", [0.0] * n))
 
         self.channels = 200 if model == "cybertruck" else 48
         self.w = FseqWriter(self.channels, self.n, self.STEP_MS)
@@ -332,6 +344,7 @@ class Composer:
         self._baseline()
         self._blinker_layer()
         self._marker_sparkle_layer()
+        self._stereo_wash_layer()
         self._beat_layer()
         self._climax_choreography()
         self._drop_layer()
@@ -396,6 +409,39 @@ class Composer:
         bursts; contrast is everything."""
         return
 
+    def _stereo_wash_layer(self):
+        """When the mix suddenly widens (side_energy / stereo_width spikes),
+        fire a brief "wash" across both front fogs + both aux parks — this
+        mimics the visual feel of a stereo opening moment (e.g. a reverb
+        tail, a pad entering, strings spreading out)."""
+        min_gap = ms_to_frames(4000, self.STEP_MS)
+        last = -min_gap * 2
+        import numpy as np
+        side = np.asarray(self.side_energy, dtype=np.float32)
+        width = np.asarray(self.stereo_width, dtype=np.float32)
+        # ~3 s rolling baseline to detect *changes* (openings of the mix)
+        k = ms_to_frames(3000, self.STEP_MS)
+        if k >= len(side):
+            return
+        base_side = np.convolve(side, np.ones(k) / k, mode="same")
+        base_width = np.convolve(width, np.ones(k) / k, mode="same")
+        # Threshold: require a real jump both above baseline AND above an
+        # absolute floor so we only fire on genuine "open" moments.
+        for f in range(self.intro_end, self.climax_end):
+            if f - last < min_gap:
+                continue
+            side_jump = side[f] - base_side[f] > 0.35 and side[f] > 0.6
+            width_jump = width[f] - base_width[f] > 0.35 and width[f] > 0.5
+            if not (side_jump or width_jump):
+                continue
+            hold = ms_to_frames(300, self.STEP_MS)
+            if self.model != "cybertruck":
+                for c in (CH["L_FRONT_FOG"], CH["R_FRONT_FOG"]):
+                    self.w.set_range(f, f + hold, c, 255)
+            for c in (CH["L_AUX_PARK"], CH["R_AUX_PARK"]):
+                self.w.set_range(f, f + hold, c, 255)
+            last = f
+
     def _blinker_layer(self):
         """Signature Tesla-show pattern: alternating L/R yellow turn signals
         running through musical subdivisions. This is the "yellow blinker"
@@ -443,46 +489,52 @@ class Composer:
 
     def _marker_sparkle_layer(self):
         """Constant sparkle on side markers, side repeaters, and license
-        plate whenever high-band energy spikes. Reference shows keep these
-        alive ~12% of the time.
+        plate whenever high-band energy spikes.
+
+        With stereo-aware analysis, the side of the car that sparkles
+        follows the actual stereo position of the high-frequency content
+        in the mix (hi-hats panned right -> right-side sparkle, etc).
         """
-        # Walk frames, fire a short sparkle at high-band onsets
-        min_gap = ms_to_frames(220, self.STEP_MS)
+        min_gap = ms_to_frames(320, self.STEP_MS)
         last_fire = -min_gap * 2
         alt = 0
         for f in range(self.intro_end, self.climax_end):
             if f - last_fire < min_gap:
                 continue
-            # Trigger threshold falls off in intro, rises in climax
             section = self._section(f)
             if section == "build":
-                thresh = 0.55
+                thresh = 0.65
             elif section == "climax":
-                thresh = 0.35
+                thresh = 0.5
             else:
-                thresh = 1.1  # never
+                thresh = 1.1
             if self.high[f] < thresh and self.onset[f] < thresh:
                 continue
-            # Pick a pattern: alternate LEFT-side, RIGHT-side, or BOTH
-            pattern = alt % 3
             hold_ms = 100 if section == "climax" else 70
             hold_frames = ms_to_frames(hold_ms, self.STEP_MS)
             left = [CH["L_SIDE_MARKER"], CH["L_SIDE_REPEATER"]]
             right = [CH["R_SIDE_MARKER"], CH["R_SIDE_REPEATER"]]
-            if pattern == 0:
-                for c in left:
-                    self.w.set_range(f, f + hold_frames, c, 255)
-            elif pattern == 1:
-                for c in right:
-                    self.w.set_range(f, f + hold_frames, c, 255)
+            # Stereo-aware side selection: if the high band is significantly
+            # panned, fire that side; if near-center, fire both.
+            pan = self.pan_high[f] if f < len(self.pan_high) else 0.0
+            if pan < -0.15:
+                target = left
+                both = False
+            elif pan > 0.15:
+                target = right
+                both = False
             else:
-                for c in left + right:
-                    self.w.set_range(f, f + hold_frames, c, 255)
-                # Big sparkle: also the license plate + aux park (CT: frunk)
-                if section == "climax":
-                    self.w.set_range(f, f + hold_frames, CH["LICENSE"], 255)
-                    self.w.set_range(f, f + hold_frames, CH["L_AUX_PARK"], 255)
-                    self.w.set_range(f, f + hold_frames, CH["R_AUX_PARK"], 255)
+                target = left + right
+                both = True
+            for c in target:
+                self.w.set_range(f, f + hold_frames, c, 255)
+            # When the mix widens or we're in climax with both-side sparkle,
+            # add license plate + aux park for extra density.
+            width = self.stereo_width[f] if f < len(self.stereo_width) else 0.0
+            if both and (section == "climax" or width > 0.5):
+                self.w.set_range(f, f + hold_frames, CH["LICENSE"], 255)
+                self.w.set_range(f, f + hold_frames, CH["L_AUX_PARK"], 255)
+                self.w.set_range(f, f + hold_frames, CH["R_AUX_PARK"], 255)
             last_fire = f
             alt += 1
 
@@ -500,9 +552,12 @@ class Composer:
                 break
             section = self._section(beat)
             strong = beat in self.strong
-            rms = self.rms[min(len(self.rms) - 1, beat)]
-            bass_here = self.bass[min(len(self.bass) - 1, beat)]
-            mid_here = self.mid[min(len(self.mid) - 1, beat)]
+            bi = min(len(self.rms) - 1, beat)
+            rms = self.rms[bi]
+            bass_here = self.bass[bi]
+            mid_here = self.mid[bi]
+            perc_here = self.perc_onset[bi] if bi < len(self.perc_onset) else 0.0
+            pan_b = self.pan_bass[bi] if bi < len(self.pan_bass) else 0.0
 
             # skip-rate per section
             if section == "intro" and (idx % 4) != 0:
@@ -525,9 +580,18 @@ class Composer:
                 self.ramp_pulse(CH["R_OUTER_BEAM"], beat, "2000", hold_ms=1500)
             else:
                 # build / climax — full beat logic
-                heavy = strong or rms > (0.5 if section == "build" else 0.4)
+                # Heavy = strong beat OR loud frame OR big percussive onset.
+                # perc_onset is cleaner than RMS — it ignores sustained loudness
+                # (pads, vocals) and spikes only on drum hits.
+                heavy = (
+                    strong
+                    or rms > (0.5 if section == "build" else 0.4)
+                    or perc_here > 0.55
+                )
+                # Kick vs snare: use percussive onset *and* bass/mid ratio.
+                is_kick = (bass_here >= mid_here) or (perc_here > 0.6 and bass_here > 0.4)
                 if heavy:
-                    if bass_here >= mid_here:
+                    if is_kick:
                         # Kick: all fronts + both turn signals + rear
                         self.all_front_flash(
                             beat, hold_ms=80 if self.model in ("model_3", "model_y") else 60
