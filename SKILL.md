@@ -75,12 +75,38 @@ cp <path/to/song.wav> <basename>.wav
 
 ### Step 4 — validate
 
+The upstream validator ends with an interactive `input("Press Enter to exit...")`
+call (meant for the Windows drag-and-drop .exe). When Claude runs it
+non-interactively, stdin is closed so `input()` raises `EOFError` and
+**the script returns exit code 1 even when the .fseq passes validation**.
+Always redirect stdin and judge by the output line, not the exit code:
+
 ```bash
-python3 light-show/validator.py <basename>.fseq
+python3 light-show/validator.py <basename>.fseq < /dev/null 2>&1 | head -n 2
 ```
 
-Expected: `Found <N> frames, step time of 20 ms for a total duration of <H:MM:SS.ffffff>.`
-If the validator prints a warning or error, **fix it before declaring success** — a non-clean file will not play on the vehicle.
+**Success** = the first output line is:
+`Found <N> frames, step time of 20 ms for a total duration of <H:MM:SS.ffffff>.`
+
+**Failure** = the first line is an error such as
+`Unknown file format, expected FSEQ v2.0`,
+`Expected 48 or 200 channels, got <X>`,
+`Expected file format to be V2 Uncompressed`, or
+`Expected total duration to be less than 4 hours, got <T>`.
+
+A trailing `EOFError: EOF when reading a line` traceback is **expected and
+harmless** — it only means the "Press Enter to exit..." prompt couldn't
+read from an empty stdin. Ignore it.
+
+If you prefer to suppress the traceback entirely:
+
+```bash
+python3 light-show/validator.py <basename>.fseq < /dev/null 2>/dev/null \
+  | grep -E '^(Found|Unknown|Expected|WARNING)' || true
+```
+
+If the validator prints a real error (not the EOFError), **fix it before
+declaring success** — a non-clean file will not play on the vehicle.
 
 ### Step 5 — report
 
