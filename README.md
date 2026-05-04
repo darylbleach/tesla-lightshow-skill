@@ -54,6 +54,38 @@ pip install librosa  # optional, ~80 MB
 All three are permissive / OSI-approved licences (BSD / ISC / MIT-equivalent) —
 free for any use.
 
+## Audio format
+
+The analyzer reads `.wav` at 44.1 kHz. For anything else, convert with
+[ffmpeg](https://ffmpeg.org/):
+
+### Convert from mp3
+
+```bash
+ffmpeg -i song.mp3 -ar 44100 -ac 2 song.wav
+```
+
+### Convert a wav that's the wrong sample rate (48 kHz → 44.1 kHz)
+
+```bash
+ffmpeg -i source.wav -ar 44100 -ac 2 song.wav
+```
+
+### Convert from other formats (m4a, aac, flac, ogg, opus …)
+
+Same pattern — ffmpeg auto-detects the input format:
+
+```bash
+ffmpeg -i song.flac  -ar 44100 -ac 2 song.wav
+ffmpeg -i song.m4a   -ar 44100 -ac 2 song.wav
+ffmpeg -i song.opus  -ar 44100 -ac 2 song.wav
+```
+
+Flag reference:
+
+- `-ar 44100` → output sample rate 44.1 kHz (Tesla requirement)
+- `-ac 2` → stereo output (our analyzer uses both channels for panning-aware light choreography)
+
 ## Install as a Claude Code skill
 
 ```bash
