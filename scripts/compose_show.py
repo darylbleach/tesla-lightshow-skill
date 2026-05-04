@@ -173,9 +173,15 @@ class Composer:
         self.channels = 200 if model == "cybertruck" else 48
         self.w = FseqWriter(self.channels, self.n, self.STEP_MS)
 
-        # Closure budgets tracked as we place commands
+        # Closure budgets tracked as we place commands. Mirrors have a
+        # 20-actuation budget per physical mirror, so they're tracked
+        # separately as mirrors_left / mirrors_right (NOT a shared pool —
+        # otherwise one mirror can run out while the other still has budget,
+        # leaving them in mismatched states).
         self.closure_used = {
-            "liftgate": 0, "mirrors": 0, "charge_port": 0, "windows": 0,
+            "liftgate": 0,
+            "mirrors_left": 0, "mirrors_right": 0,
+            "charge_port": 0, "windows": 0,
             "door_handles": 0, "front_doors": 0, "falcon_doors": 0,
         }
         self.rng = random.Random(42)
@@ -707,30 +713,70 @@ class Composer:
         dance_end = min(self.n, d + ms_to_frames(10_000, self.STEP_MS))
         self.w.set_range(d, dance_end, CH["CHARGE_PORT"], CLOSURE["dance"])
 
-        # Mirror flap: reference-style continuous ~18 s wiper pattern.
-        # 9 open/close cycles × 2 mirrors = 18 actuations per mirror (mirrors
-        # have a 20-actuation budget). Cycle period ~2 s (close → open → close
-        # fits within the 2 s actuation time). Start 9 s before the peak so
-        # the flapping is already in full swing when the peak hits and keeps
-        # going for ~9 s after.
+        # Mirror flap: reference-style continuous wiper pattern.
+        #
+        # Each mirror has its own 20-actuation thermal budget, counted
+        # separately by the firmware. Each flap cycle consumes 2 actuations
+        # per mirror (one Open + one Close), so 9 cycles = 18 actuations —
+        # just inside the limit. Using separate budget keys per mirror
+        # prevents the shared-budget bug that left one mirror open and the
+        # other closed on long shows.
+        #
+        # CRITICAL: we must always end with both mirrors in the same state
+        # (both closed = both folded in the factory default position). Any
+        # path that bails out early must still emit the matching Close for
+        # every Open it wrote. We do that by collecting planned moves, then
+        # truncating the list so the final move on each mirror is a Close.
         flap_count = 9
         flap_period = ms_to_frames(2000, self.STEP_MS)
         mir_start = d - ms_to_frames(9000, self.STEP_MS)
         if mir_start < 0:
             mir_start = 0
+        r_offset = ms_to_frames(100, self.STEP_MS)  # R trails L by 100 ms
+
+        # Plan moves for both mirrors independently. Each list contains
+        # (frame, action) tuples in chronological order.
+        left_moves = []
+        right_moves = []
         for i in range(flap_count):
             t = mir_start + i * flap_period
             if t + flap_period >= self.n:
                 break
-            # On each cycle, open both mirrors then close both
-            self.closure(CH["L_MIRROR"], t, "open", hold_ms=200,
-                         budget_key="mirrors", limit=19)
-            self.closure(CH["R_MIRROR"], t + ms_to_frames(100, self.STEP_MS),
-                         "open", hold_ms=200, budget_key="mirrors", limit=19)
-            self.closure(CH["L_MIRROR"], t + flap_period // 2, "close", hold_ms=200,
-                         budget_key="mirrors", limit=19)
-            self.closure(CH["R_MIRROR"], t + flap_period // 2 + ms_to_frames(100, self.STEP_MS),
-                         "close", hold_ms=200, budget_key="mirrors", limit=19)
+            left_moves.append((t, "open"))
+            right_moves.append((t + r_offset, "open"))
+            left_moves.append((t + flap_period // 2, "close"))
+            right_moves.append((t + flap_period // 2 + r_offset, "close"))
+
+        def write_mirror_sequence(moves, channel, budget_key):
+            """Emit moves until the budget is hit, but guarantee the final
+            emitted move is a Close so the mirror ends in the folded-back
+            state. If we'd hit the limit mid-cycle, drop back to the last
+            Close."""
+            # trim to an even count so the last emitted move is a Close
+            # (list is ordered open/close/open/close/...)
+            trimmed = []
+            for move in moves:
+                # Check if adding this would exceed budget
+                if self.closure_used.get(budget_key, 0) >= 19:
+                    break
+                trimmed.append(move)
+                # Tentatively increment so the budget check above is accurate
+                # for the next iteration.
+                self.closure_used[budget_key] = self.closure_used.get(budget_key, 0) + 1
+            # Ensure last action is "close". If it's "open" we dropped its
+            # matching close — so remove that final open (and refund the
+            # budget we tentatively spent on it).
+            while trimmed and trimmed[-1][1] != "close":
+                trimmed.pop()
+                self.closure_used[budget_key] -= 1
+            # Now actually write the FSEQ bytes. The budget was already
+            # accounted for above, so bypass closure()'s internal counter
+            # by passing budget_key=None.
+            for frame, action in trimmed:
+                self.closure(channel, frame, action, hold_ms=200)
+
+        write_mirror_sequence(left_moves, CH["L_MIRROR"], "mirrors_left")
+        write_mirror_sequence(right_moves, CH["R_MIRROR"], "mirrors_right")
 
         # Model S: door handles pop at the peak
         if self.model == "model_s":
