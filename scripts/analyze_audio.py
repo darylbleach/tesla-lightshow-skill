@@ -66,6 +66,13 @@ try:
 except Exception:
     HAVE_LIBROSA = False
 
+try:
+    from madmom.features.beats import DBNBeatTrackingProcessor, RNNBeatProcessor  # type: ignore
+    from madmom.features.downbeats import DBNDownBeatTrackingProcessor, RNNDownBeatProcessor  # type: ignore
+    HAVE_MADMOM = True
+except Exception:
+    HAVE_MADMOM = False
+
 
 FRAME_MS = 20  # must match FSEQ step_time
 
@@ -305,8 +312,21 @@ def analyze(L: np.ndarray, R: np.ndarray, sr: int):
     centroid_clipped = np.clip(centroid, 100.0, 8000.0)
     brightness = (np.log(centroid_clipped) - math.log(100.0)) / (math.log(8000.0) - math.log(100.0))
 
-    # --- beats / tempo -----------------------------------------------------
-    tempo_bpm, beat_frames = beats_and_tempo(perc_onset, onset, hop, sr, L, R)
+    # --- beats / tempo / downbeats -----------------------------------------
+    # Dual-tracker: run librosa and madmom beat trackers independently and
+    # cross-check. Each detected beat gets a confidence score:
+    #   2.0  both trackers agree within ±40 ms
+    #   1.0  madmom-only beat (madmom usually wins on accuracy)
+    #   0.7  librosa-only beat
+    #   +0.5 bonus if coincides with a strong perc_onset spike
+    # madmom also gives us real downbeats (not "every 4th beat" guesses).
+    beat_data = dual_tracker_beats(L, R, sr, hop, n_frames, perc_onset)
+    tempo_bpm = beat_data["tempo_bpm"]
+    beat_frames = beat_data["beat_frames"]
+    beat_confidence = beat_data["beat_confidence"]
+    downbeat_frames = beat_data["downbeat_frames"]
+    meter = beat_data["meter"]  # 3 or 4 for 3/4 or 4/4
+    agreement_pct = beat_data["agreement_pct"]
 
     # --- drops --------------------------------------------------------------
     drops = detect_drops(rms_n)
@@ -322,18 +342,63 @@ def analyze(L: np.ndarray, R: np.ndarray, sr: int):
     # the feature usable).
     chroma, key_tonic, key_mode = chroma_and_key(L, R, sr, hop, n_frames, mag_mono, freqs)
 
+    # --- structural segmentation -------------------------------------------
+    # Replace the hardcoded 15/55/85% narrative split with real section
+    # boundaries detected from the song's self-similarity matrix.
+    # Section count adapts to song length: short songs get fewer segments.
+    segments = detect_segments(mag_mono, chroma, n_frames, hop, sr, rms_n)
+
+    # --- two-pass energy re-normalisation ----------------------------------
+    # Pass 1 normalised against global 99th-percentile, which means a quiet
+    # intro next to a loud chorus gets squashed. Re-normalise each section
+    # against its own local 99th percentile so verse-level dynamics survive.
+    rms_local = local_normalise(rms_n, segments)
+    bass_local = local_normalise(band_out["bass"], segments)
+    mid_local = local_normalise(band_out["mid"], segments)
+    high_local = local_normalise(band_out["high"], segments)
+
+    # Pick "strong" beats. If madmom gave us real downbeats, use those.
+    # Otherwise fall back to high-confidence beats (≥ 1.5 = both trackers
+    # agreed OR madmom + HPSS agreed). As a last resort: every Nth beat
+    # where N = detected meter.
+    if downbeat_frames:
+        strong_frames = downbeat_frames
+    elif beat_confidence:
+        strong_frames = [
+            b for b, c in zip(beat_frames, beat_confidence) if c >= 1.5
+        ]
+        if not strong_frames:
+            strong_frames = beat_frames[::max(2, meter)]
+    else:
+        strong_frames = beat_frames[::max(2, meter)]
+
+    analyzer_stack = []
+    if HAVE_LIBROSA:
+        analyzer_stack.append("librosa")
+    if HAVE_MADMOM:
+        analyzer_stack.append("madmom")
+    if not analyzer_stack:
+        analyzer_stack.append("numpy-stereo")
+
     result = {
         "sr": int(sr),
         "hop": int(hop),
         "frame_ms": FRAME_MS,
         "n_frames": int(n_frames),
-        "analyzer": "librosa" if HAVE_LIBROSA else "numpy-stereo",
+        "analyzer": analyzer_stack[0],  # backward compat
+        "analyzer_stack": analyzer_stack,
         "tempo_bpm": float(tempo_bpm),
+        "meter": int(meter),
+        "beat_agreement_pct": float(agreement_pct),
         "rms": rms_n.tolist(),
+        "rms_local": rms_local.tolist(),
         "bass": band_out["bass"].tolist(),
+        "bass_local": bass_local.tolist(),
         "low_mid": band_out["low_mid"].tolist(),
         "mid": band_out["mid"].tolist(),
+        "mid_local": mid_local.tolist(),
         "high": band_out["high"].tolist(),
+        "high_local": high_local.tolist(),
         "mel": mel_norm.tolist(),
         "mid_energy": mid_energy.tolist(),
         "side_energy": side_energy.tolist(),
@@ -348,8 +413,11 @@ def analyze(L: np.ndarray, R: np.ndarray, sr: int):
         "onset": onset.tolist(),
         "brightness": brightness.tolist(),
         "beat_frames": [int(b) for b in beat_frames],
-        "strong_beat_frames": [int(b) for b in beat_frames[::4]],
+        "beat_confidence": [float(c) for c in beat_confidence],
+        "strong_beat_frames": [int(b) for b in strong_frames],
+        "downbeat_frames": [int(b) for b in downbeat_frames],
         "drop_frames": [int(d) for d in drops],
+        "segments": segments,  # list of {"start", "end", "label", "energy"}
         "chroma": chroma.tolist(),
         "key_tonic": [int(t) for t in key_tonic],
         "key_mode": [int(m) for m in key_mode],
@@ -480,7 +548,303 @@ def _key_detection_sliding(chroma: np.ndarray, hop: int, sr: int, window_s: floa
 
 
 # ---------------------------------------------------------------------------
-# Beat + tempo
+# Dual-tracker beat detection (librosa + madmom cross-check)
+# ---------------------------------------------------------------------------
+
+def dual_tracker_beats(L, R, sr, hop, n_frames, perc_onset):
+    """Run both beat trackers and fuse the results.
+
+    Returns a dict with:
+        beat_frames         merged beat positions (frame indices)
+        beat_confidence     per-beat confidence 0.7..2.5
+        downbeat_frames     madmom downbeats, empty if unavailable
+        tempo_bpm           tempo estimate (prefers madmom)
+        meter               3 or 4 (from madmom downbeats, default 4)
+        agreement_pct       % of beats both trackers agreed on (0..100)
+    """
+    frame_sr = sr / hop  # frames per second
+    tol_frames = int(0.040 * frame_sr)  # ±40 ms tolerance for agreement
+
+    librosa_beats = []
+    librosa_tempo = 120.0
+    if HAVE_LIBROSA:
+        try:
+            y = 0.5 * (L + R)
+            tempo, frames = librosa.beat.beat_track(
+                y=y.astype(np.float32), sr=sr, hop_length=hop, units="frames"
+            )
+            librosa_tempo = float(np.atleast_1d(tempo)[0])
+            librosa_beats = [int(b) for b in frames]
+        except Exception:
+            pass
+
+    madmom_beats = []
+    madmom_downbeats = []
+    madmom_tempo = 0.0
+    madmom_meter = 4
+    if HAVE_MADMOM:
+        try:
+            mono = (0.5 * (L + R)).astype(np.float32)
+            # madmom needs 44100 Hz mono float32
+            if sr != 44100:
+                # madmom can handle other rates but its pretrained models were
+                # trained on 44.1 kHz, so degrade gracefully.
+                raise RuntimeError("madmom expects 44100 Hz input")
+            # RNN beat activation → DBN post-processing for final beat times.
+            rnn_beat = RNNBeatProcessor()
+            dbn_beat = DBNBeatTrackingProcessor(
+                min_bpm=60.0, max_bpm=200.0, fps=100
+            )
+            act = rnn_beat(mono)
+            beat_times = dbn_beat(act)
+            madmom_beats = [int(round(t * frame_sr)) for t in beat_times]
+
+            # Downbeats (same song, but separate RNN+DBN pipeline).
+            rnn_db = RNNDownBeatProcessor()
+            dbn_db = DBNDownBeatTrackingProcessor(
+                beats_per_bar=[3, 4], fps=100
+            )
+            act_db = rnn_db(mono)
+            db_out = dbn_db(act_db)
+            # db_out is a Nx2 array: (time_s, beat_position_in_bar). Position
+            # 1 = downbeat. Meter = number of unique positions per bar.
+            if len(db_out):
+                madmom_downbeats = [
+                    int(round(t * frame_sr))
+                    for t, pos in db_out
+                    if int(round(pos)) == 1
+                ]
+                unique_positions = sorted({int(round(p)) for _, p in db_out})
+                if unique_positions:
+                    madmom_meter = max(unique_positions)
+
+            # Tempo from DBN beats (median inter-beat interval).
+            if len(beat_times) >= 2:
+                intervals = np.diff(beat_times)
+                if len(intervals) > 0:
+                    madmom_tempo = float(60.0 / np.median(intervals))
+        except Exception as e:
+            # Don't crash the whole analysis if madmom has a bad day
+            print(f"  (madmom failed: {e}; falling back to librosa only)",
+                  file=sys.stderr)
+
+    # Prefer madmom's tempo if we have it, else librosa.
+    if madmom_tempo > 0:
+        tempo_bpm = madmom_tempo
+    elif librosa_beats:
+        tempo_bpm = librosa_tempo
+    else:
+        tempo_bpm = 120.0
+    meter = madmom_meter if madmom_beats else 4
+
+    # Merge beats from both sources. Strategy:
+    #   For each madmom beat: find closest librosa beat within ±tol.
+    #     Found → confidence 2.0, average of the two positions
+    #     Not found → confidence 1.0, madmom position
+    #   Remaining unmatched librosa beats → confidence 0.7
+    #   Bonus +0.5 if the merged position coincides with a perc_onset peak.
+    merged = []
+    used_librosa = set()
+
+    def nearest(target, pool, used):
+        best_i, best_d = -1, tol_frames + 1
+        for i, p in enumerate(pool):
+            if i in used:
+                continue
+            d = abs(p - target)
+            if d < best_d:
+                best_d, best_i = d, i
+        return best_i, best_d
+
+    agreed = 0
+    for mb in madmom_beats:
+        i, d = nearest(mb, librosa_beats, used_librosa)
+        if i >= 0 and d <= tol_frames:
+            pos = (mb + librosa_beats[i]) // 2
+            conf = 2.0
+            used_librosa.add(i)
+            agreed += 1
+        else:
+            pos = mb
+            conf = 1.0
+        merged.append((pos, conf))
+
+    for i, lb in enumerate(librosa_beats):
+        if i in used_librosa:
+            continue
+        merged.append((lb, 0.7))
+
+    # If we have neither tracker's beats, fall back to numpy autocorrelation.
+    if not merged:
+        tempo_bpm, np_beats = _beats_numpy(perc_onset, hop, sr)
+        merged = [(b, 0.7) for b in np_beats]
+
+    # Sort by frame position and apply perc_onset bonus.
+    merged.sort(key=lambda x: x[0])
+    window = max(1, int(0.030 * frame_sr))  # ±30 ms window
+    for idx, (pos, conf) in enumerate(merged):
+        lo = max(0, pos - window)
+        hi = min(n_frames, pos + window + 1)
+        if hi > lo and np.max(perc_onset[lo:hi]) > 0.65:
+            merged[idx] = (pos, conf + 0.5)
+
+    beat_frames = [m[0] for m in merged if 0 <= m[0] < n_frames]
+    beat_confidence = [m[1] for m in merged if 0 <= m[0] < n_frames]
+
+    total = max(len(madmom_beats), len(librosa_beats), 1)
+    agreement_pct = 100.0 * agreed / total
+
+    return {
+        "tempo_bpm": float(tempo_bpm),
+        "meter": int(meter),
+        "beat_frames": beat_frames,
+        "beat_confidence": beat_confidence,
+        "downbeat_frames": [b for b in madmom_downbeats if 0 <= b < n_frames],
+        "agreement_pct": agreement_pct,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Structural segmentation (replace hardcoded 15/55/85% narrative arc)
+# ---------------------------------------------------------------------------
+
+def detect_segments(mag_mono, chroma, n_frames, hop, sr, rms_n):
+    """Detect verse/chorus/bridge boundaries from the song's self-similarity.
+
+    Uses librosa.segment.agglomerative on stacked chroma + MFCC features
+    when librosa is available. Section count adapts to song length.
+
+    Returns a list of dicts:
+        [{"start": frame_int, "end": frame_int, "label": str,
+          "energy": float, "index": int}, ...]
+
+    Labels: "intro", "verse", "chorus", "bridge", "outro" inferred by
+    energy pattern and position in the song. Fallback labels are
+    "section_0", "section_1", ... if librosa isn't available.
+    """
+    duration_s = n_frames * FRAME_MS / 1000.0
+    # Adaptive segment count
+    if duration_s < 90:
+        target = 4
+    elif duration_s < 240:
+        target = 6
+    else:
+        target = 8
+    target = min(target, max(3, n_frames // 250))  # sanity bounds
+
+    boundaries = None
+    if HAVE_LIBROSA:
+        try:
+            # Build a compact feature stack: 12-dim chroma + 13-dim MFCC,
+            # both smoothed. librosa does the heavy lifting.
+            hop_l = int(hop)
+            # Compute MFCC at our frame grid
+            y_mfcc_frames = librosa.feature.mfcc(
+                S=librosa.amplitude_to_db(mag_mono.T + 1e-9),
+                n_mfcc=13,
+            )
+            feat = np.vstack([chroma.T, y_mfcc_frames])
+            # agglomerative returns boundary frame indices in its own grid.
+            # Since we built the features on our hop, the grid matches.
+            boundaries = librosa.segment.agglomerative(feat, k=target + 1)
+            boundaries = [int(b) for b in boundaries]
+            # Ensure 0 and n_frames are endpoints
+            if 0 not in boundaries:
+                boundaries = [0] + boundaries
+            if boundaries[-1] < n_frames:
+                boundaries.append(n_frames)
+            boundaries = sorted(set(boundaries))
+        except Exception as e:
+            print(f"  (segmentation failed: {e}; using uniform split)",
+                  file=sys.stderr)
+            boundaries = None
+
+    if boundaries is None:
+        # Uniform fallback split
+        step = n_frames // target
+        boundaries = list(range(0, n_frames, step)) + [n_frames]
+        boundaries = sorted(set(boundaries))
+
+    # Build segments with energy stats
+    raw = []
+    for i in range(len(boundaries) - 1):
+        s, e = boundaries[i], boundaries[i + 1]
+        if e <= s:
+            continue
+        energy = float(np.mean(rms_n[s:e]))
+        raw.append({"start": s, "end": e, "energy": energy})
+
+    # Label by heuristics: highest-energy repeated pattern = chorus,
+    # first/last low-energy segments = intro/outro, else verse/bridge.
+    if not raw:
+        return []
+    n_seg = len(raw)
+    energies = [s["energy"] for s in raw]
+    max_e = max(energies)
+    min_e = min(energies)
+    threshold_hi = min_e + 0.65 * (max_e - min_e)
+    threshold_lo = min_e + 0.25 * (max_e - min_e)
+
+    labels = [None] * n_seg
+
+    # Intro: first 1-2 low-energy segments
+    if raw[0]["energy"] < threshold_lo:
+        labels[0] = "intro"
+        if n_seg > 1 and raw[1]["energy"] < threshold_lo:
+            labels[1] = "intro"
+
+    # Outro: last 1-2 low/medium-energy segments
+    if raw[-1]["energy"] < threshold_hi:
+        labels[-1] = "outro"
+        if n_seg > 1 and raw[-2]["energy"] < threshold_hi and labels[-2] is None:
+            labels[-2] = "outro"
+
+    # Choruses = high-energy segments
+    for i, seg in enumerate(raw):
+        if labels[i] is None and seg["energy"] >= threshold_hi:
+            labels[i] = "chorus"
+
+    # Bridges = a single medium-energy segment between choruses late in song
+    for i in range(1, n_seg - 1):
+        if labels[i] is None and labels[i - 1] == "chorus" and labels[i + 1] == "chorus":
+            labels[i] = "bridge"
+
+    # Remaining = verses
+    for i in range(n_seg):
+        if labels[i] is None:
+            labels[i] = "verse"
+
+    return [
+        {
+            "index": i,
+            "start": seg["start"],
+            "end": seg["end"],
+            "energy": seg["energy"],
+            "label": labels[i],
+        }
+        for i, seg in enumerate(raw)
+    ]
+
+
+def local_normalise(x, segments):
+    """Re-normalise a feature array per segment against its own 99th
+    percentile. Keeps dynamics visible inside a quiet verse even when a
+    loud chorus dominates the global range."""
+    if not segments:
+        return np.asarray(x, dtype=np.float32)
+    out = np.asarray(x, dtype=np.float32).copy()
+    for seg in segments:
+        s, e = seg["start"], seg["end"]
+        if e <= s:
+            continue
+        chunk = out[s:e]
+        p = float(np.percentile(chunk, 99)) + 1e-9
+        out[s:e] = np.clip(chunk / p, 0.0, 1.0)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Beat + tempo (legacy single-tracker — kept for backward compat)
 # ---------------------------------------------------------------------------
 
 def beats_and_tempo(perc_onset, onset, hop, sr, L, R):
@@ -572,14 +936,22 @@ def main():
     out.write_text(json.dumps(analysis))
     dur = analysis["n_frames"] * FRAME_MS / 1000.0
     stereo_mean = float(np.mean(analysis["stereo_width"]))
+    stack = ",".join(analysis.get("analyzer_stack", [analysis.get("analyzer", "?")]))
+    seg_summary = " + ".join(
+        f"{s['label']}({(s['end']-s['start'])*FRAME_MS/1000:.0f}s)"
+        for s in analysis.get("segments", [])
+    ) or "no segments"
     print(
         f"Analyzed {wav.name}: {dur:.1f}s, {analysis['n_frames']} frames, "
-        f"tempo ≈ {analysis['tempo_bpm']:.1f} BPM, "
-        f"{len(analysis['beat_frames'])} beats, "
+        f"tempo ≈ {analysis['tempo_bpm']:.1f} BPM, meter {analysis.get('meter',4)}/4, "
+        f"{len(analysis['beat_frames'])} beats "
+        f"({analysis.get('beat_agreement_pct',0):.0f}% tracker agreement), "
+        f"{len(analysis.get('downbeat_frames', []))} downbeats, "
         f"{len(analysis['drop_frames'])} drops, "
         f"stereo_width≈{stereo_mean:.2f}, "
-        f"analyzer={analysis['analyzer']}"
+        f"analyzers={stack}"
     )
+    print(f"  structure: {seg_summary}")
 
 
 if __name__ == "__main__":

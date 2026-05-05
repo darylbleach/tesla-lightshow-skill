@@ -48,17 +48,25 @@ three-act piece:
 
 - Python 3.10+
 - `numpy` (required)
-- `librosa` (optional but recommended — better beat tracking, especially on
-  slow or non-percussive music)
+- `librosa` (optional — chroma, CQT, structural segmentation, fallback beat tracker)
+- `madmom` (optional — state-of-the-art beat + downbeat tracker, cross-checks librosa)
 - `scipy` (optional — speeds up HPSS; pure-numpy fallback included)
 
 ```bash
 pip install numpy
-pip install librosa  # optional, ~80 MB
+pip install librosa    # optional, ~80 MB
+pip install madmom     # optional, adds ~60 MB; cross-checks librosa beats
+pip install scipy      # optional, speeds up HPSS
 ```
 
-All three are permissive / OSI-approved licences (BSD / ISC / MIT-equivalent) —
-free for any use.
+When **both** librosa and madmom are installed the analyzer runs them as a
+dual-tracker cross-check: beats confirmed by both get a higher confidence
+score, madmom's downbeats give us real meter detection (3/4 vs 4/4) and
+proper downbeats, and the composer gates its biggest hits on high-confidence
+beats only.
+
+All four libraries are permissive / OSI-approved licences
+(BSD / ISC / MIT-equivalent) — free for any use.
 
 ## Audio format
 

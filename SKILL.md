@@ -59,33 +59,50 @@ markers because the hi-hats are panned right in this bar".
 
 Features emitted (all arrays are 0..1 unless noted; one value per 20 ms frame):
 
-- **Energy**: `rms`, `bass` (20–200 Hz), `low_mid` (200–800), `mid` (800–3200), `high` (3200+), `mel[32]` (log-spaced)
-- **Mid/Side**: `mid_energy` (center of the mix), `side_energy` (stereo/ambience), `stereo_width` (0 = mono, 1 = fully wide)
+- **Energy (global)**: `rms`, `bass` (20–200 Hz), `low_mid` (200–800), `mid` (800–3200), `high` (3200+), `mel[32]` (log-spaced)
+- **Energy (per-section)**: `rms_local`, `bass_local`, `mid_local`, `high_local` — re-normalised within each detected section so quiet verses preserve their own dynamic range
+- **Mid/Side**: `mid_energy`, `side_energy`, `stereo_width` (0 = mono, 1 = fully wide)
 - **Panning** (−1 = hard left, +1 = hard right): `pan_bass`, `pan_mid`, `pan_high`, `pan_overall`
-- **HPSS**: `perc_rms`, `perc_onset` (drum/hat-only onset), `harm_rms` (chords/vocals)
+- **HPSS**: `perc_rms`, `perc_onset`, `harm_rms`
 - **Broadband**: `onset`, `brightness`
-- **Structure**: `beat_frames`, `strong_beat_frames`, `drop_frames`, `tempo_bpm`
-- **Metadata**: `analyzer` = `"librosa"` or `"numpy-stereo"`
+- **Chroma / harmony**: `chroma[12]`, `key_tonic` (0..11), `key_mode` (0=minor, 1=major)
+- **Beats + downbeats**: `beat_frames`, `beat_confidence` (0.7..2.5), `downbeat_frames`, `strong_beat_frames`, `tempo_bpm`, `meter` (3 or 4), `beat_agreement_pct`
+- **Structure**: `segments` — list of `{"start", "end", "label", "energy", "index"}` with labels intro/verse/chorus/bridge/outro
+- **Drops**: `drop_frames`
+- **Metadata**: `analyzer_stack` — list of libraries in use (e.g. `["librosa", "madmom"]`)
 
-#### Optional: librosa for better beat tracking
+#### Optional libraries (auto-detected)
 
-The analyzer auto-detects **librosa** at import time and uses its
-Ellis-style beat tracker when available. Pure numpy is the fallback.
-Librosa gives noticeably better beat tracking on:
-
-- Slow / non-percussive music (anthems, ballads, classical)
-- Songs with tempo changes
-- Syncopated rhythms
-
-To install:
+The analyzer works with pure numpy but uses three optional libraries
+when they're installed. Install any or all for a quality boost:
 
 ```bash
-pip3 install librosa
+pip3 install librosa      # chroma, CQT, segmentation, fallback beat tracker
+pip3 install madmom       # excellent beat + downbeat tracker
+pip3 install scipy        # faster HPSS (pure-numpy fallback exists)
 ```
 
-It's free (ISC license, MIT-equivalent) and pulls in ~80 MB of
-scientific Python. Everything else in the pipeline still works
-without it — the output just uses the simpler built-in tracker.
+**librosa + madmom cross-check**: when both are installed, the
+analyzer runs both beat trackers and cross-checks. Beats confirmed by
+both (±40 ms) get confidence 2.0, madmom-only beats get 1.0,
+librosa-only get 0.7, and any beat that coincides with a strong
+percussive onset gets a further +0.5 bonus. This means the composer
+can gate its biggest hits on high-confidence beats only — the
+`strong_beat_frames` list is derived from real downbeats (madmom) when
+available, not "every 4th beat" guesses.
+
+**Structural segmentation**: uses librosa's self-similarity + agglomerative
+clustering on a chroma+MFCC feature stack. Segment count adapts to
+song length (3–5 for short, 4–7 for medium, 5–9 for long). Labels are
+inferred heuristically: low-energy first/last segments become intro/outro,
+the highest-energy segments become choruses, medium segments between
+choruses become bridges, and the rest are verses. The composer uses
+the detected sections to place the narrative arc — the climax now
+lands on the song's actual highest-energy chorus instead of at a fixed
+55–85% time window.
+
+All three libraries are permissive / OSI-approved licences
+(BSD / ISC / MIT-equivalent) — free for any use.
 
 ### Step 2 — compose the show
 

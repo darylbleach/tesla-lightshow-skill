@@ -436,32 +436,69 @@ class Composer:
         self._interior_layer()
 
     def _plan_sections(self):
-        """Compute the narrative arc: intro / build / climax / outro.
+        """Compute the narrative arc.
 
-        Tesla shows follow a dramatic structure — start quiet, build light
-        activity, culminate with physical movement (trunk/mirrors/doors),
-        then wind down. We always schedule the physical-movement moment
-        during the `climax` window, at the loudest sustained 2 s we can
-        find in that window. This guarantees closures fire even for songs
-        without a classic EDM drop.
+        Two modes:
+
+        * **Music-structure mode** (preferred) — if the analyzer detected
+          segments with labels (intro/verse/chorus/bridge/outro), we use
+          them directly. The climax lives in the highest-energy chorus
+          section; everything before it is intro/build; everything after
+          is outro. This means the big moment lands on the song's actual
+          peak, not a time-based proxy.
+
+        * **Legacy fallback** — older analysis JSON without segments uses
+          the original 15/55/85% split based on time.
+
+        We also find the specific `climax_peak` frame (loudest sustained
+        2 s) inside the climax region for the physical-movement timing.
         """
-        import numpy as np  # analyze_audio already requires this
+        import numpy as np
         n = self.n
-        self.intro_end = int(n * 0.15)
-        self.build_end = int(n * 0.55)
-        self.climax_end = int(n * 0.85)
-        # climax window: build_end .. climax_end
-        # Find loudest sustained 2 s chunk inside it
+        segments = self.a.get("segments") or []
+        # Keep the raw list for the beat layer's per-segment tuning
+        self.segments = segments
+
+        if segments:
+            # Pick the climax = highest-energy chorus (fallback: highest
+            # energy overall). Surrounding segments become intro/build/outro.
+            chorus_segs = [s for s in segments if s["label"] == "chorus"]
+            pool = chorus_segs if chorus_segs else segments
+            climax_seg = max(pool, key=lambda s: s["energy"])
+            climax_start = climax_seg["start"]
+            climax_end = climax_seg["end"]
+            # Intro = up to the first non-intro segment
+            first_non_intro = 0
+            for i, s in enumerate(segments):
+                if s["label"] != "intro":
+                    first_non_intro = i
+                    break
+            self.intro_end = segments[first_non_intro]["start"] if first_non_intro else n // 10
+            # Build = first non-intro segment → start of climax
+            self.build_end = climax_start
+            # Climax ends at end of climax segment
+            self.climax_end = climax_end
+        else:
+            # Legacy fallback
+            self.intro_end = int(n * 0.15)
+            self.build_end = int(n * 0.55)
+            self.climax_end = int(n * 0.85)
+
+        # Guarantee sane ordering even on edge cases
+        self.intro_end = max(0, min(self.intro_end, n - 1))
+        self.build_end = max(self.intro_end + 1, min(self.build_end, n - 1))
+        self.climax_end = max(self.build_end + 1, min(self.climax_end, n))
+
+        # Find loudest sustained 2 s chunk inside the climax region
         win = ms_to_frames(2000, self.STEP_MS)
         rms = np.asarray(self.rms, dtype=np.float32)
         best = self.build_end + (self.climax_end - self.build_end) // 2
         if self.climax_end - self.build_end > win:
-            # simple boxcar
             kernel = np.ones(win, dtype=np.float32) / win
             smooth = np.convolve(rms, kernel, mode="same")
             seg = smooth[self.build_end : self.climax_end]
             best = self.build_end + int(np.argmax(seg))
-        self.climax_peak = best  # single dramatic moment in the climax
+        self.climax_peak = best
 
     def _section(self, f: int) -> str:
         if f < self.intro_end:
