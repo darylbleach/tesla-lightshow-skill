@@ -54,6 +54,30 @@ Constraints:
 
 Recommend **48-channel** output for Model 3/Y.
 
+### Model 3 Highland (2024+ refresh)
+
+Exterior hardware is identical to the regular Model 3 — headlights ramp, turn signals ramp, same channel layout. The difference is the **interior**:
+
+- **Center Front Display RGB** (always had this, even pre-refresh)
+- **Five-segment interior accent LED strip** added with the Highland refresh:
+  - Center Front (dashboard)
+  - Left Front (driver's door)
+  - Right Front (passenger's door)
+  - Left Rear (rear driver's side)
+  - Right Rear (rear passenger's side)
+
+All six surfaces are full RGB. They sit on FSEQ channels 176–193 (six 3-byte groups), which means the show needs to be written as a **200-channel** file.
+
+Composer behaviour for `model_3_highland`:
+- Channels 1–46: byte-identical to a `model_3` show (same exterior choreography).
+- Channels 47–175: all zero (these are Cybertruck-only hardware).
+- Channels 176–193: driven by `_chroma_rgb_layer` — hue from chroma, saturation from HPSS harmonic richness, value from RMS, with a small per-surface hue offset so colour spatial-gradients across the cabin.
+- Channels 194–200: all zero (reserved).
+
+**Backward compatible:** a 200-channel Highland show plays on any pre-refresh Model 3 — the firmware ignores the channels the hardware doesn't have. So if you share a Highland show with a friend who has an older car, it still works.
+
+Recommend **200-channel** output for Model 3 Highland.
+
 ### Model S
 
 Signature and Front Turn are **boolean only** on Model S — so give them crisp on-beat blinks rather than fades. Ramping is still available for Main Beams and Ch 4-6.

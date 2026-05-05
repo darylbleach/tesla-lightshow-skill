@@ -169,8 +169,30 @@ class Composer:
         self.perc_onset = analysis.get("perc_onset", analysis.get("onset", [0.0] * n))
         self.perc_rms = analysis.get("perc_rms", analysis.get("rms", [0.0] * n))
         self.harm_rms = analysis.get("harm_rms", analysis.get("rms", [0.0] * n))
+        # Chroma + key (for chroma-driven interior RGB on Highland).
+        self.chroma = analysis.get("chroma", None)  # list of 12-element lists or None
+        self.key_tonic = analysis.get("key_tonic", [0] * n)
+        self.key_mode = analysis.get("key_mode", [1] * n)  # default major
 
-        self.channels = 200 if model == "cybertruck" else 48
+        # Channel count per model:
+        #   * Cybertruck: 200 (needs light bars + interior RGB).
+        #   * Model 3 Highland (and any other trim with interior accent
+        #     lights): also 200 so we can write channels 176-193 for
+        #     interior RGB. Channels 47-175 stay zero (CT-specific hardware
+        #     that Highland doesn't have — the firmware ignores them).
+        #   * Everything else: 48.
+        # A 200-channel file plays perfectly on a 48-channel car — the
+        # firmware just ignores channels beyond what the hardware supports.
+        if model == "cybertruck" or model == "model_3_highland":
+            self.channels = 200
+        else:
+            self.channels = 48
+
+        # Trims that share Model 3/Y's ramping lighting behaviour. Highland
+        # is a Model 3 refresh — its exterior ramping capabilities are the
+        # same as the base Model 3, so any per-model branch should treat
+        # both identically.
+        self._is_m3_or_my_family = model in ("model_3", "model_3_highland", "model_y")
         self.w = FseqWriter(self.channels, self.n, self.STEP_MS)
 
         # Closure budgets tracked as we place commands. Mirrors have a
@@ -201,6 +223,63 @@ class Composer:
         span_ms = max(hold_ms, dur_map[ramp] + 50)
         end = frame + ms_to_frames(span_ms, self.STEP_MS)
         self.w.set_range(frame, end, ch, level)
+
+    def ramp_to_beat(self, ch: int, beat: int, ramp: str, tail_ms: int = 80,
+                     max_ramp_frac_of_beat: float = 0.9):
+        """Beat-aligned ramp pulse: the ramp PEAKS on the beat frame.
+
+        A naive `ramp_pulse` starts the ramp byte AT the beat, so the LED
+        reaches peak ramp_ms later — the eye locks onto the peak and the
+        pulse reads as off-beat. Here we back-date the start by the ramp
+        duration so the LED's swell completes exactly on the beat, then
+        briefly hold peak for `tail_ms` before snapping off.
+
+        Automatic tempo scaling: a ramp that would overlap with the
+        previous beat is shrunk down. `max_ramp_frac_of_beat` is the
+        most the ramp is allowed to span of the inter-beat gap
+        (0.9 = 90% of a beat period). If even the shortest ramp
+        ("500" = 500 ms) would blow past that budget, we fall back to an
+        instant pulse, preserving the on-beat feel at any tempo.
+        """
+        ramp_ms_map = {"500": 500, "1000": 1000, "2000": 2000}
+        level_map = {"500": 178, "1000": 204, "2000": 230}
+
+        # Budget: how much of the upstream timeline can the ramp occupy?
+        # Derived from the last preceding beat (so we don't overlap) or
+        # the tempo-implied beat period if `self.beats` is empty.
+        if getattr(self, "beats", None):
+            prev = next((b for b in reversed(self.beats) if b < beat), None)
+            gap_frames = (beat - prev) if prev is not None else beat
+        else:
+            gap_frames = ms_to_frames(60_000 / max(1.0, self.tempo), self.STEP_MS)
+        gap_ms = max(1, gap_frames) * self.STEP_MS
+        budget_ms = int(gap_ms * max_ramp_frac_of_beat)
+
+        # Shrink ramp if the requested duration doesn't fit the budget.
+        chosen = ramp
+        for candidate in (ramp, "1000", "500"):
+            if ramp_ms_map[candidate] <= budget_ms:
+                chosen = candidate
+                break
+        else:
+            # Nothing fits — fall back to an instant pulse ON the beat.
+            end = beat + ms_to_frames(max(tail_ms, 60), self.STEP_MS)
+            self.w.set_range(beat, end, ch, 255)
+            return
+
+        ramp_ms = ramp_ms_map[chosen]
+        level = level_map[chosen]
+        start = beat - ms_to_frames(ramp_ms, self.STEP_MS)
+        # Also clamp to 0 so we never write before the show starts.
+        if start < 0:
+            # Not enough runway — fall back to instant pulse on-beat so the
+            # show still attacks precisely on the first beat.
+            end = beat + ms_to_frames(max(tail_ms, 60), self.STEP_MS)
+            self.w.set_range(beat, end, ch, 255)
+            return
+        # Hold peak briefly past the beat for a clean "landing" then off.
+        peak_end = beat + ms_to_frames(max(tail_ms, self.STEP_MS), self.STEP_MS)
+        self.w.set_range(start, peak_end, ch, level)
 
     def ramp_on_off(self, ch: int, frame: int, on_dur_ms: int, off_dur_ms: int, peak_hold_ms: int):
         """Ramp a channel up, hold, then ramp down (nice breathing effect)."""
@@ -584,16 +663,16 @@ class Composer:
                 continue
 
             if section == "intro":
-                # soft, sparse ramp-pulse alternating sides (outer beam only —
-                # keeps inner beams reserved for big beats)
+                # Beat-aligned swell: ramp PEAKS on the beat (not starts on it),
+                # so the eye's perceived-onset lands on the downbeat.
                 if alt % 2 == 0:
-                    self.ramp_pulse(CH["L_OUTER_BEAM"], beat, "1000", hold_ms=600)
+                    self.ramp_to_beat(CH["L_OUTER_BEAM"], beat, "1000", tail_ms=80)
                 else:
-                    self.ramp_pulse(CH["R_OUTER_BEAM"], beat, "1000", hold_ms=600)
+                    self.ramp_to_beat(CH["R_OUTER_BEAM"], beat, "1000", tail_ms=80)
             elif section == "outro":
-                # fade the whole car down — long ramps on outer beams only
-                self.ramp_pulse(CH["L_OUTER_BEAM"], beat, "2000", hold_ms=1500)
-                self.ramp_pulse(CH["R_OUTER_BEAM"], beat, "2000", hold_ms=1500)
+                # Long breathing swell that peaks on the beat, both sides.
+                self.ramp_to_beat(CH["L_OUTER_BEAM"], beat, "2000", tail_ms=120)
+                self.ramp_to_beat(CH["R_OUTER_BEAM"], beat, "2000", tail_ms=120)
             else:
                 # build / climax — full beat logic
                 # Heavy = strong beat OR loud frame OR big percussive onset.
@@ -610,7 +689,7 @@ class Composer:
                     if is_kick:
                         # Kick: all fronts + both turn signals + rear
                         self.all_front_flash(
-                            beat, hold_ms=80 if self.model in ("model_3", "model_y") else 60
+                            beat, hold_ms=80 if self._is_m3_or_my_family else 60
                         )
                         self.pulse(CH["L_FRONT_TURN"], beat, hold_ms=120)
                         self.pulse(CH["R_FRONT_TURN"], beat, hold_ms=120)
@@ -649,7 +728,7 @@ class Composer:
                         # Instant pulse instead of a ramp so the outer beam
                         # contributes crisp short hits rather than long
                         # on-time between beats (was washing the car out).
-                        if self.model in ("model_3", "model_y"):
+                        if self._is_m3_or_my_family:
                             ch_use = CH["L_OUTER_BEAM"] if (alt // 2) % 2 == 0 else CH["R_OUTER_BEAM"]
                             self.pulse(ch_use, beat, hold_ms=60, level=255)
                         else:
@@ -863,47 +942,146 @@ class Composer:
                 )
 
     def _interior_layer(self):
-        """Interior RGB wash + light-bar effects driven by audio envelope."""
+        """Interior RGB + (Cybertruck only) light-bar effects.
+
+        Only 200-channel shows write RGB bytes. Two driving modes:
+
+        * If chroma data is available (requires librosa during analysis),
+          drive interior hue from the song's actual harmony — the tonic
+          note maps to red, other pitch classes wrap around the color
+          wheel, minor key shifts the whole palette toward warmer.
+          Saturation follows HPSS harmonic richness; value follows RMS.
+          This gives Model 3 Highland (and future RGB-equipped trims)
+          a much more musical interior than a brightness-only wash.
+
+        * Otherwise (older analysis JSON without chroma), fall back to
+          the original brightness-driven hue wash.
+
+        Cybertruck also gets its exterior light-bar baseline animation
+        regardless of chroma availability.
+        """
         if self.channels < 200:
-            # Only the center display is in 48-ch range — not present!
-            # Actually RGB is channels 176+ which is only in 200-ch shows.
-            # For 48-ch shows, we skip the interior RGB layer entirely.
             return
 
-        # Overall hue drifts slowly with brightness (cool/warm mapping),
-        # pulses forward on each beat.
-        beats_set = set(self.beats)
+        # RGB surfaces live at channels 176..193 (six 3-byte groups).
+        # They're the only RGB hardware we care about for interior light
+        # on any current Tesla.
+        has_chroma = self.chroma is not None and len(self.chroma) >= self.n
 
-        def hue(f, frac):
-            base = 0.66 * (1.0 - self.brightness[min(len(self.brightness) - 1, f)])
-            # slow drift
-            base += 0.05 * math.sin(f * 0.002)
-            # beat kick
-            if f in beats_set:
-                base += 0.12
-            return base
+        if has_chroma:
+            self._chroma_rgb_layer()
+        else:
+            # Legacy fallback: brightness-driven hue wash.
+            beats_set = set(self.beats)
 
-        self.rgb_wash(0, self.n, hue)
+            def hue(f, frac):
+                base = 0.66 * (1.0 - self.brightness[min(len(self.brightness) - 1, f)])
+                base += 0.05 * math.sin(f * 0.002)
+                if f in beats_set:
+                    base += 0.12
+                return base
 
-        # Light bar baseline: low hum with kick synchronization
-        front_start = CH["FRONT_BAR_START"]
-        rear_start = CH["REAR_BAR_START"]
+            self.rgb_wash(0, self.n, hue)
+
+        # Cybertruck-only: exterior light-bar baseline. Skip for Highland
+        # since it has no light bars (channels 47-162 stay zero for it).
+        if self.model == "cybertruck":
+            front_start = CH["FRONT_BAR_START"]
+            rear_start = CH["REAR_BAR_START"]
+            for f in range(self.n):
+                env = self.bass[f]
+                lvl = int(clamp(env * 255, 0, 255))
+                for i in range(10, 50):  # center 40 LEDs of front bar
+                    if self.w.frames[f * self.channels + front_start - 1 + i] < lvl:
+                        self.w.set(f, front_start + i, lvl)
+                for i in range(8, 44):
+                    if self.w.frames[f * self.channels + rear_start - 1 + i] < lvl:
+                        self.w.set(f, rear_start + i, lvl)
+
+    def _chroma_rgb_layer(self):
+        """Drive the six interior RGB surfaces from audio harmony.
+
+        Per frame:
+          * Hue: dominant chroma bin, rotated so the current key's tonic
+            is always red. Chord changes = visible color changes. Minor
+            key shifts the whole hue ring by ~0.08 toward warmer.
+          * Saturation: harmonic richness (HPSS harmonic RMS) with a 0.7
+            floor so it stays visually intense. Drum breaks desaturate
+            slightly toward white.
+          * Value (brightness): RMS envelope with a 0.35 floor during
+            harmonic content so the interior never fully blacks out
+            mid-song.
+
+        Each of the six surfaces gets a small per-surface hue offset
+        (5-8% apart on the wheel) so colors spatial-gradient across the
+        cabin instead of all being identical.
+        """
+        # (r_start_channel, hue_offset) for each of the six surfaces
+        surfaces = [
+            (CH["CENTER_DISPLAY_R"], 0.00),
+            (CH["CENTER_ACCENT_R"], 0.03),
+            (CH["L_FRONT_RGB_R"], -0.05),
+            (CH["R_FRONT_RGB_R"], 0.05),
+            (CH["L_REAR_RGB_R"], -0.08),
+            (CH["R_REAR_RGB_R"], 0.08),
+        ]
+        chroma = self.chroma
+        tonic = self.key_tonic
+        mode = self.key_mode
+
         for f in range(self.n):
-            env = self.bass[f]
-            lvl = int(clamp(env * 255, 0, 255))
-            # Center segment always mirrors bass
-            for i in range(10, 50):  # center 40 LEDs of front bar
-                if self.w.frames[f * self.channels + front_start - 1 + i] < lvl:
-                    self.w.set(f, front_start + i, lvl)
-            for i in range(8, 44):
-                if self.w.frames[f * self.channels + rear_start - 1 + i] < lvl:
-                    self.w.set(f, rear_start + i, lvl)
+            cf = chroma[f]
+            # Dominant pitch class in this frame
+            dom = 0
+            best = cf[0]
+            for i in range(1, 12):
+                if cf[i] > best:
+                    best = cf[i]
+                    dom = i
+            # Rotate so tonic = 0 (red). Note: pitch classes go up in
+            # semitones, but hue wraps smoothly — we map 12 pitch classes
+            # uniformly around the hue wheel for simplicity.
+            rel = (dom - tonic[f]) % 12
+            base_hue = rel / 12.0
+            if mode[f] == 0:  # minor — warm the palette
+                base_hue = (base_hue + 0.08) % 1.0
+
+            # Saturation: harmonic richness with a high floor for intensity.
+            h_rms = self.harm_rms[f] if f < len(self.harm_rms) else 0.5
+            sat = 0.7 + 0.3 * h_rms  # clamped to [0.7, 1.0]
+
+            # Value: RMS envelope with a floor.
+            rms = self.rms[f]
+            if h_rms > 0.15:
+                val = max(0.35, rms)
+            else:
+                val = rms  # pure drum breaks can fully dim
+
+            for r_ch, offset in surfaces:
+                if r_ch + 2 > self.channels:
+                    continue
+                h = (base_hue + offset) % 1.0
+                r, g, b = hsv_to_rgb(h, sat, clamp(val, 0.0, 1.0))
+                self.w.set(f, r_ch, r)
+                self.w.set(f, r_ch + 1, g)
+                self.w.set(f, r_ch + 2, b)
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--analysis", required=True)
-    p.add_argument("--model", required=True, choices=["model_3", "model_s", "model_x", "model_y", "cybertruck"])
+    p.add_argument(
+        "--model",
+        required=True,
+        choices=[
+            "model_3",
+            "model_3_highland",  # 2024+ Model 3 refresh with interior accent lights
+            "model_s",
+            "model_x",
+            "model_y",
+            "cybertruck",
+        ],
+    )
     p.add_argument("--out", required=True)
     args = p.parse_args()
 

@@ -13,13 +13,16 @@ The skill needs two things:
 
 1. **A path to a `.wav` file** (must be 44.1 kHz — warn the user if it is not; output will still be written but may drift on the vehicle).
 2. **The Tesla model.** If the user didn't state it in the prompt, ask which of these they have — **do not guess**:
-   - `Model 3`
+   - `Model 3` (pre-2024, no interior accent lights)
+   - `Model 3 Highland` (2024+ refresh, has interior accent lights)
    - `Model S`
    - `Model X`
    - `Model Y`
    - `Cybertruck`
 
-Accept natural variations ("cybertruck", "model s 2022", "3", "Y", "x", "plaid x", etc.) and map them to the five values.
+Accept natural variations ("cybertruck", "model s 2022", "3", "Y", "x", "plaid x", "highland", "2024 model 3", "new model 3", etc.) and map them to the six values.
+
+**About Model 3 Highland**: the 2024+ refresh added a five-segment interior LED accent strip (left front, center front, right front, left rear, right rear) plus keeps the full-RGB center front display. We unlock these with the `model_3_highland` compose target which generates a 200-channel show. A 200-channel Highland show still plays on older Model 3s — the firmware simply ignores the channels the car's hardware doesn't have, so it's fully backward-compatible.
 
 ## What the skill produces
 
@@ -88,10 +91,10 @@ without it — the output just uses the simpler built-in tracker.
 
 ```bash
 python3 skill/scripts/compose_show.py --analysis /tmp/<basename>.json \
-  --model {model_3|model_s|model_x|model_y|cybertruck} --out <basename>.fseq
+  --model {model_3|model_3_highland|model_s|model_x|model_y|cybertruck} --out <basename>.fseq
 ```
 
-Normalize the model argument to one of: `model_3`, `model_s`, `model_x`, `model_y`, `cybertruck`.
+Normalize the model argument to one of: `model_3`, `model_3_highland`, `model_s`, `model_x`, `model_y`, `cybertruck`.
 
 The composer binds audio features to model-appropriate channels (see `references/model_capabilities.md` and `references/channel_map.md`). It respects closure actuation limits and pre-opens liftgates/charge ports in time for dances at drops.
 
@@ -165,6 +168,7 @@ Full tables are in `references/channel_map.md` and `references/model_capabilitie
 ## Model-specific reminders
 
 - **Model 3 / Model Y** — exploit the ramping on Front Turn, Signature, and Channels 4-6. Prefer ramp_pulse over instant pulses for anything lasting > 200 ms. Aux Park / Side Markers are OR'd together — don't stack them continuously or they won't appear to flash.
+- **Model 3 Highland (2024+)** — same exterior behaviour as Model 3 (the two are byte-identical for channels 1–46) but the composer also writes channels 176–193 (the six interior RGB surfaces) with chroma-driven colour. Hue follows the dominant pitch class relative to the song's detected key; saturation follows HPSS harmonic richness with a 0.7 floor so the palette stays visually intense; value follows RMS with a 0.35 floor during harmonic content. Minor keys shift the hue wheel ~0.08 toward warmer. Each of the six surfaces gets a small per-surface hue offset so colours spatial-gradient across the cabin. The show is 200 channels but the extra bytes are all zero outside the RGB range, so it plays fine on older Model 3s too.
 - **Model S** — Signature and Front Turn are boolean only; use crisp hits. Door Handles (4 independent) are a unique accent — pop them 1.2 s before a drop and close 0.5 s after for a cool reveal. 20-actuation budget is generous. No Falcon or Front Doors.
 - **Model X** — Same boolean headlights as Model S (no ramping on Signature / Front Turn) but with **Falcon Doors** and **Front Doors** for the most dramatic choreography of any car. Falcon Doors open in ~20 s and close in ~8 s; Front Doors open in ~22 s and close in ~3 s — schedule Opens **~25 s before a drop** so doors are fully open for the Dance/Close beat. Only **6 actuations** each per show, use them for headline moments. Model X also has **Rear Fog (even in NA)** — an extra accent channel the other US cars don't have. No Door Handles (those are S-only).
 - **Cybertruck** — Generate 200-channel output. Animate the front/rear light bars (curtain, chase, bars, full styles). Brake + Rear Turn are full-brightness controlled: drive them with the RMS envelope instead of 0/100 values. Bed Lights always ramp 500 ms regardless of request.

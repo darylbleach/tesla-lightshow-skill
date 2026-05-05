@@ -311,6 +311,17 @@ def analyze(L: np.ndarray, R: np.ndarray, sr: int):
     # --- drops --------------------------------------------------------------
     drops = detect_drops(rms_n)
 
+    # --- chroma + key -------------------------------------------------------
+    # Chroma is a 12-dim pitch-class profile per frame (C, C#, D, ..., B).
+    # Used to drive interior RGB hue from actual harmony. Key/mode detection
+    # gives us a whole-song or sliding-window tonic so hue mapping can be
+    # key-relative instead of absolute.
+    #
+    # Both require librosa. If librosa is unavailable we fall back to
+    # pseudo-chroma derived from our mel bands (less accurate but keeps
+    # the feature usable).
+    chroma, key_tonic, key_mode = chroma_and_key(L, R, sr, hop, n_frames, mag_mono, freqs)
+
     result = {
         "sr": int(sr),
         "hop": int(hop),
@@ -339,8 +350,133 @@ def analyze(L: np.ndarray, R: np.ndarray, sr: int):
         "beat_frames": [int(b) for b in beat_frames],
         "strong_beat_frames": [int(b) for b in beat_frames[::4]],
         "drop_frames": [int(d) for d in drops],
+        "chroma": chroma.tolist(),
+        "key_tonic": [int(t) for t in key_tonic],
+        "key_mode": [int(m) for m in key_mode],
     }
     return result
+
+
+def chroma_and_key(L, R, sr, hop, n_frames, mag_mono, freqs):
+    """Compute a per-frame chroma vector (n_frames × 12) and sliding-window
+    key detection (tonic 0..11, mode 0=minor / 1=major).
+
+    Prefers librosa for both (chroma_cqt is robust and much cleaner than
+    FFT-based chroma). Falls back to a simple FFT-based chroma if librosa
+    is unavailable.
+    """
+    # 1) Chroma
+    if HAVE_LIBROSA:
+        try:
+            y = 0.5 * (L + R)
+            # chroma_cqt gives a 12 × T matrix; transpose to (T, 12).
+            c = librosa.feature.chroma_cqt(
+                y=y.astype(np.float32), sr=sr, hop_length=hop, n_chroma=12
+            ).T
+            # librosa may return a different T depending on centered framing;
+            # align to n_frames by truncation/padding.
+            if c.shape[0] > n_frames:
+                c = c[:n_frames]
+            elif c.shape[0] < n_frames:
+                pad = np.zeros((n_frames - c.shape[0], 12), dtype=c.dtype)
+                c = np.concatenate([c, pad], axis=0)
+            chroma = c.astype(np.float32)
+        except Exception:
+            chroma = _fft_chroma(mag_mono, freqs)
+    else:
+        chroma = _fft_chroma(mag_mono, freqs)
+
+    # Normalize each frame to sum-to-1 so chroma[t] is a probability-like
+    # distribution over pitch classes.
+    chroma = chroma / (chroma.sum(axis=1, keepdims=True) + 1e-9)
+
+    # 2) Key + mode (Krumhansl-Schmuckler profiles, sliding window)
+    key_tonic, key_mode = _key_detection_sliding(chroma, hop, sr)
+    return chroma, key_tonic, key_mode
+
+
+def _fft_chroma(mag_mono, freqs):
+    """Pseudo-chroma from FFT magnitudes. Maps each positive frequency to
+    its pitch class (note modulo 12) and sums magnitudes into 12 bins."""
+    # Ignore sub-audible; any f < ~27 Hz is below musical range (A0 = 27.5)
+    n_frames, n_bins = mag_mono.shape
+    chroma = np.zeros((n_frames, 12), dtype=np.float32)
+    # pitch class per bin: 12 * log2(f / 440) + 9 mod 12   (A = 9)
+    valid = freqs > 27.0
+    pc_all = np.zeros_like(freqs)
+    pc_all[valid] = (12.0 * np.log2(freqs[valid] / 440.0) + 9.0) % 12.0
+    pc_int = np.floor(pc_all).astype(int) % 12
+    for pc in range(12):
+        mask = valid & (pc_int == pc)
+        if mask.any():
+            chroma[:, pc] = mag_mono[:, mask].sum(axis=1)
+    return chroma
+
+
+# Krumhansl-Schmuckler major/minor profiles (standard reference values).
+_KS_MAJOR = np.array(
+    [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88],
+    dtype=np.float32,
+)
+_KS_MINOR = np.array(
+    [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17],
+    dtype=np.float32,
+)
+
+
+def _key_detection_sliding(chroma: np.ndarray, hop: int, sr: int, window_s: float = 15.0):
+    """Per-frame (tonic, mode) estimate via a ~15 s sliding window. For each
+    window we correlate the averaged chroma against 24 key templates (12
+    major + 12 minor rotations of the Krumhansl-Schmuckler profile) and pick
+    the highest.
+
+    Returns two arrays of length n_frames:
+        tonic: 0..11 (0 = C, 1 = C#, ..., 11 = B)
+        mode:  0 = minor, 1 = major
+    """
+    n_frames = chroma.shape[0]
+    frames_per_sec = sr / hop
+    win = int(window_s * frames_per_sec)
+    win = max(win, 30)
+    hop_win = max(1, win // 4)
+
+    tonic = np.zeros(n_frames, dtype=np.int16)
+    mode = np.zeros(n_frames, dtype=np.int16)
+    # Precompute all 24 rotated templates.
+    templates = np.zeros((24, 12), dtype=np.float32)
+    for i in range(12):
+        templates[i] = np.roll(_KS_MAJOR, i)       # major keys 0..11
+        templates[12 + i] = np.roll(_KS_MINOR, i)  # minor keys 12..23
+    # normalize
+    templates = (templates - templates.mean(axis=1, keepdims=True))
+    templates = templates / (np.linalg.norm(templates, axis=1, keepdims=True) + 1e-9)
+
+    # Compute correlation for each window center, then interpolate per frame.
+    centers = list(range(0, n_frames, hop_win))
+    if centers[-1] != n_frames - 1:
+        centers.append(n_frames - 1)
+    key_choices = []
+    for c in centers:
+        lo = max(0, c - win // 2)
+        hi = min(n_frames, c + win // 2)
+        avg = chroma[lo:hi].mean(axis=0)
+        avg = avg - avg.mean()
+        norm = np.linalg.norm(avg) + 1e-9
+        avg = avg / norm
+        scores = templates @ avg  # length 24
+        best = int(np.argmax(scores))
+        key_choices.append(best)
+    # Fill each frame with the nearest window center's choice.
+    for i, c in enumerate(centers):
+        lo = centers[i - 1] if i > 0 else 0
+        hi = centers[i + 1] if i + 1 < len(centers) else n_frames
+        mid = (lo + c) // 2 if i > 0 else 0
+        end = (c + hi) // 2 if i + 1 < len(centers) else n_frames
+        best = key_choices[i]
+        t, m = best % 12, 1 if best < 12 else 0
+        tonic[mid:end] = t
+        mode[mid:end] = m
+    return tonic, mode
 
 
 # ---------------------------------------------------------------------------

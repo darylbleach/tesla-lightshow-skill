@@ -9,11 +9,17 @@ ready to play the show via Toybox → Light Show → Schedule Show.
 
 Supported models:
 
-- **Model 3** (including 2024+ Highland)
+- **Model 3** (pre-2024)
+- **Model 3 Highland** (2024+ refresh — unlocks the interior accent RGB strip)
 - **Model S** (2021+)
 - **Model X** (2021+)
 - **Model Y**
 - **Cybertruck**
+
+Highland shows are forward-compatible: they're 200-channel files that include
+both the normal lighting and the interior RGB hue data. A Highland `.fseq`
+plays on a pre-refresh Model 3 just fine — the firmware ignores the channels
+the car doesn't have.
 
 ## What makes it different
 
@@ -121,7 +127,9 @@ python3 /path/to/light-show/validator.py song.fseq < /dev/null | head -1
 Then copy `song.fseq` and `song.wav` into a `LightShow/` folder on a FAT32 / exFAT
 USB stick (no NTFS, no `TeslaCam/` folder on the drive).
 
-Model argument is one of: `model_3`, `model_s`, `model_x`, `model_y`, `cybertruck`.
+Model argument is one of: `model_3`, `model_3_highland`, `model_s`, `model_x`, `model_y`, `cybertruck`.
+
+Pick `model_3_highland` if your car has the interior LED accent strip (all 2024+ Model 3s). The composer will drive the six RGB surfaces (center display, center accent, left/right front, left/right rear) with chroma-based colour — hue follows the song's harmony, saturation follows chord richness, brightness follows loudness, and the whole palette tilts toward warmer tones in minor keys.
 
 ## How it works
 
