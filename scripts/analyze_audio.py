@@ -340,6 +340,8 @@ def analyze(L: np.ndarray, R: np.ndarray, sr: int):
     # --- drops --------------------------------------------------------------
     drops = detect_drops(rms_n)
 
+    # (music region + onset peaks detected below after chroma is available)
+
     # --- chroma + key -------------------------------------------------------
     # Chroma is a 12-dim pitch-class profile per frame (C, C#, D, ..., B).
     # Used to drive interior RGB hue from actual harmony. Key/mode detection
@@ -350,6 +352,26 @@ def analyze(L: np.ndarray, R: np.ndarray, sr: int):
     # pseudo-chroma derived from our mel bands (less accurate but keeps
     # the feature usable).
     chroma, key_tonic, key_mode = chroma_and_key(L, R, sr, hop, n_frames, mag_mono, freqs)
+
+    # --- non-music region trim (head/tail applause, announcements) ---------
+    # Live recordings often have 10-30 s of crowd noise + MC speech at the
+    # start and applause at the end. These are characterized by UNSTABLE
+    # chroma (applause = broadband noise, speech = rapidly shifting formants)
+    # and HIGH spectral flatness. Detect the first/last frame where music
+    # reliably lives; composer zero-fills outside this window.
+    music_start, music_end = detect_music_region(
+        mag_mono, freqs, sr, hop, n_frames, beat_frames, beat_confidence,
+        perc_onset, chroma=chroma,
+    )
+
+    # --- onset peaks (real hits, grid-free) --------------------------------
+    # Pick local maxima of perc_onset: every actual percussive hit (kick,
+    # snare, strum) regardless of whether it fits a beat grid. Used by the
+    # composer's onset layer to fire crisp pulses on real musical events —
+    # what a human light designer sees when scrubbing the waveform in xLights.
+    onset_frames, onset_strength = pick_onset_peaks(
+        perc_onset, hop, sr, music_start, music_end
+    )
 
     # --- structural segmentation -------------------------------------------
     # Replace the hardcoded 15/55/85% narrative split with real section
@@ -428,6 +450,10 @@ def analyze(L: np.ndarray, R: np.ndarray, sr: int):
         "strong_beat_frames": [int(b) for b in strong_frames],
         "downbeat_frames": [int(b) for b in downbeat_frames],
         "drop_frames": [int(d) for d in drops],
+        "onset_frames": [int(f) for f in onset_frames],
+        "onset_strength": [float(s) for s in onset_strength],
+        "music_start": int(music_start),
+        "music_end": int(music_end),
         "segments": segments,  # list of {"start", "end", "label", "energy"}
         "chroma": chroma.tolist(),
         "key_tonic": [int(t) for t in key_tonic],
@@ -1020,6 +1046,144 @@ def _beats_numpy(onset, hop, sr):
     return float(tempo_bpm), [int(b) for b in beats]
 
 
+def detect_music_region(mag_mono, freqs, sr, hop, n_frames,
+                         beat_frames, beat_confidence, perc_onset, chroma=None):
+    """Return (music_start_frame, music_end_frame) trimming non-music head
+    and tail (applause, crowd noise, MC announcements).
+
+    The strongest signal for "music vs applause" is **chroma stability**:
+
+      * Music: a held note or chord keeps the chroma vector pointing at the
+        same pitch classes for hundreds of ms. The frame-to-frame Euclidean
+        distance between normalised chroma vectors is small.
+      * Applause / crowd: broadband noise → chroma flat → frame-to-frame
+        distance moderate.
+      * Speech / MC: rapidly shifting formants → chroma jumps around
+        → frame-to-frame distance large.
+
+    We compute frame-to-frame chroma distance, smooth it to 1 s, then
+    declare "music" where smoothed distance is below a threshold (learned
+    from the song's own distribution) AND 1-second RMS is non-trivial.
+    Walk forward from the start and backward from the end to find the
+    first/last frames satisfying this for ~2 s sustained.
+
+    If no clear boundary is found (e.g. studio recording with no applause)
+    the function returns (0, n_frames) and nothing is trimmed.
+    """
+    frame_sr = sr / hop
+    sec = int(frame_sr)
+    if sec < 2 or n_frames < 4 * sec or chroma is None or len(chroma) < n_frames:
+        return 0, n_frames
+
+    chroma_arr = np.asarray(chroma, dtype=np.float32)
+    # Normalise each row to unit length so we're comparing directions, not
+    # magnitudes (absolute chroma energy can be high during loud applause).
+    norms = np.linalg.norm(chroma_arr, axis=1, keepdims=True) + 1e-9
+    chroma_unit = chroma_arr / norms
+
+    # Frame-to-frame Euclidean distance. Stable music → tiny values.
+    diffs = np.linalg.norm(np.diff(chroma_unit, axis=0), axis=1)
+    diffs = np.concatenate([diffs, diffs[-1:]])  # pad to n_frames
+
+    # Smooth to 1 s
+    kernel = np.ones(sec, dtype=np.float32) / sec
+    inst = np.convolve(diffs, kernel, mode="same")
+
+    # Threshold: music is below the 40th percentile of frame-to-frame
+    # chroma distance (empirically — music is the STABLE portion).
+    stable_thresh = float(np.percentile(inst, 40))
+    # Safety floor — even pure music has some distance
+    stable_thresh = max(stable_thresh, 0.12)
+    # Safety cap
+    stable_thresh = min(stable_thresh, 0.35)
+
+    # 1-second-smoothed RMS (reuse from mag_mono — compute cheaply)
+    frame_rms = np.sqrt(np.mean(mag_mono * mag_mono, axis=1))
+    rms_smooth = np.convolve(frame_rms, kernel, mode="same")
+    rms_floor = float(np.percentile(rms_smooth, 30))
+
+    is_music = (inst < stable_thresh) & (rms_smooth > rms_floor * 0.5)
+
+    # Walk forward, require 2 s sustained
+    hold = 2 * sec
+    music_start = 0
+    for f in range(n_frames - hold):
+        if is_music[f : f + hold].mean() > 0.75:
+            music_start = f
+            break
+
+    # Walk backward
+    music_end = n_frames
+    for f in range(n_frames - 1, hold, -1):
+        if is_music[f - hold : f].mean() > 0.75:
+            music_end = f
+            break
+
+    # Safety: if we over-trimmed (<50% survives), disable
+    if music_end - music_start < 0.5 * n_frames:
+        return 0, n_frames
+
+    return music_start, music_end
+
+
+def pick_onset_peaks(perc_onset, hop, sr, music_start, music_end):
+    """Return (onset_frames, onset_strength) for every local peak in the
+    percussive onset signal inside the music region.
+
+    These are the "real hits" — one entry per kick / snare / strum / pluck
+    detected in the audio, grid-free. The composer can use these to fire
+    crisp pulses on actual musical events rather than on a tempo grid.
+
+    * Dynamic threshold: frame must exceed (local median + 0.8 × local MAD).
+    * Minimum 80 ms spacing between peaks (prevents double-firing on the
+      decay of a single hit).
+    * Peaks clipped to the music region only.
+    """
+    n = len(perc_onset)
+    if n == 0:
+        return [], []
+    frame_sr = sr / hop
+    min_gap = max(1, int(0.080 * frame_sr))  # 80 ms
+
+    arr = np.asarray(perc_onset, dtype=np.float32)
+    # Local baseline: 2 s rolling median
+    win = max(1, int(2.0 * frame_sr))
+    if win > 1 and n > win:
+        # Use a simple running median approximation via sorted windowing
+        # (scipy.signal.medfilt would be cleaner but we avoid the dep here)
+        from numpy.lib.stride_tricks import sliding_window_view
+        pad = np.pad(arr, (win // 2, win - 1 - win // 2), mode="edge")
+        windows = sliding_window_view(pad, window_shape=win)
+        median_baseline = np.median(windows, axis=-1)
+        mad = np.median(np.abs(windows - median_baseline[:, None]), axis=-1)
+    else:
+        median_baseline = np.full_like(arr, float(np.median(arr)))
+        mad = np.full_like(arr, float(np.median(np.abs(arr - np.median(arr)))))
+
+    # A peak must exceed baseline + 0.8*MAD AND be a local max
+    threshold = median_baseline + 0.8 * mad + 0.05
+
+    frames = []
+    strengths = []
+    last = -min_gap * 2
+    for f in range(max(1, music_start), min(n - 1, music_end)):
+        if arr[f] < threshold[f]:
+            continue
+        if arr[f] <= arr[f - 1] or arr[f] <= arr[f + 1]:
+            continue  # not a strict local max
+        if f - last < min_gap:
+            # Keep the stronger of the two within the gap
+            if strengths and arr[f] > strengths[-1]:
+                frames[-1] = f
+                strengths[-1] = float(arr[f])
+                last = f
+            continue
+        frames.append(f)
+        strengths.append(float(arr[f]))
+        last = f
+    return frames, strengths
+
+
 def detect_drops(rms_norm):
     n = len(rms_norm)
     if n < 200:
@@ -1079,11 +1243,22 @@ def main():
         f"{len(analysis['beat_frames'])} beats "
         f"({analysis.get('beat_agreement_pct',0):.0f}% tracker agreement), "
         f"{len(analysis.get('downbeat_frames', []))} downbeats, "
+        f"{len(analysis.get('onset_frames', []))} onsets, "
         f"{n_change} tempo change{'s' if n_change != 1 else ''}, "
         f"{len(analysis['drop_frames'])} drops, "
         f"stereo_width≈{stereo_mean:.2f}, "
         f"analyzers={stack}"
     )
+    ms_start = analysis.get("music_start", 0)
+    ms_end = analysis.get("music_end", analysis["n_frames"])
+    if ms_start > 0 or ms_end < analysis["n_frames"]:
+        trimmed_head = ms_start * FRAME_MS / 1000.0
+        trimmed_tail = (analysis["n_frames"] - ms_end) * FRAME_MS / 1000.0
+        print(
+            f"  music region: {trimmed_head:.1f}s–"
+            f"{ms_end * FRAME_MS / 1000.0:.1f}s  "
+            f"(trimmed {trimmed_head:.1f}s head, {trimmed_tail:.1f}s tail)"
+        )
     print(f"  structure: {seg_summary}")
 
 

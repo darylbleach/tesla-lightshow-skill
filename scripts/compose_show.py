@@ -180,6 +180,12 @@ class Composer:
             "tempo_curve", [self.tempo] * n
         )
         self.tempo_change_points = analysis.get("tempo_change_points", [])
+        # Music region (for trimming applause / silence from start / end)
+        self.music_start = int(analysis.get("music_start", 0))
+        self.music_end = int(analysis.get("music_end", n))
+        # Grid-free onset peaks — every real percussive hit in the audio
+        self.onset_frames = analysis.get("onset_frames", [])
+        self.onset_strength = analysis.get("onset_strength", [])
 
         # Channel count per model:
         #   * Cybertruck: 200 (needs light bars + interior RGB).
@@ -469,9 +475,16 @@ class Composer:
         self._marker_sparkle_layer()
         self._stereo_wash_layer()
         self._beat_layer()
+        self._onset_layer()
+        self._outro_burst_layer()
         self._climax_choreography()
         self._drop_layer()
         self._interior_layer()
+        # LAST: zero out everything before music_start and after music_end so
+        # the car stays dark during applause / MC announcements / silent
+        # lead-ins. Runs after all other layers so every other layer can be
+        # written freely and this is the final authority on "no lights".
+        self._mute_non_music_region()
 
     def _plan_sections(self):
         """Compute the narrative arc.
@@ -1039,6 +1052,211 @@ class Composer:
                 self.cybertruck_lightbar_sweep(
                     d, d + ms_to_frames(2000, self.STEP_MS), style="chase"
                 )
+
+    def _onset_layer(self):
+        """Grid-free: fire short pulses on every detected percussive onset.
+
+        This is the "xLights way" — a human light designer watches the
+        waveform and drops an effect on every kick, snare, or strum they
+        see. Our onset_frames array contains exactly those hits: every
+        local peak in perc_onset above a dynamic threshold, regardless of
+        whether it fits a beat grid.
+
+        Works brilliantly for songs with sparse / variable rhythm (ballads,
+        live recordings, tempo-changing songs like Stairway to Heaven)
+        where grid-based beat tracking breaks down.
+
+        Intensity follows the section arc — intros get soft outer-beam
+        sparkles, choruses get full-front hits, the outro goes wild if the
+        song's outro is percussively active.
+        """
+        if not self.onset_frames:
+            return
+
+        # Avoid double-stimulating with the beat_layer: skip onsets that fall
+        # within ±80 ms of an existing beat hit we already handled.
+        beat_set = set(self.beats)
+        beat_skip_window = ms_to_frames(80, self.STEP_MS)
+
+        # Pre-compute set of nearby beat frames for fast lookup
+        nearby_beat = set()
+        for b in self.beats:
+            for off in range(-beat_skip_window, beat_skip_window + 1):
+                nearby_beat.add(b + off)
+
+        for f, strength in zip(self.onset_frames, self.onset_strength):
+            if f < self.music_start or f >= self.music_end:
+                continue
+            if f in nearby_beat:
+                continue  # beat_layer already covered this one
+
+            section = self._section(f)
+            section_intensity = self._section_intensity(f)
+            hit_strength = min(1.0, strength) * section_intensity
+
+            if section == "intro":
+                # very sparse, very soft — only the strongest onsets
+                if hit_strength < 0.7:
+                    continue
+                ch = CH["L_OUTER_BEAM"] if (f // 50) % 2 == 0 else CH["R_OUTER_BEAM"]
+                self.pulse(ch, f, hold_ms=40, level=180)
+            elif section == "outro":
+                # OUTRO ONSETS RUN FULL INTENSITY (handles outro drum rolls)
+                if hit_strength < 0.35:
+                    continue
+                # Fire alternating front beams + signature + a side marker
+                use_left = (f // 40) % 2 == 0
+                if use_left:
+                    self.pulse(CH["L_OUTER_BEAM"], f, hold_ms=80)
+                    self.pulse(CH["L_INNER_BEAM"], f, hold_ms=80)
+                    self.pulse(CH["L_SIGNATURE"], f, hold_ms=80)
+                    self.pulse(CH["L_SIDE_MARKER"], f, hold_ms=80)
+                else:
+                    self.pulse(CH["R_OUTER_BEAM"], f, hold_ms=80)
+                    self.pulse(CH["R_INNER_BEAM"], f, hold_ms=80)
+                    self.pulse(CH["R_SIGNATURE"], f, hold_ms=80)
+                    self.pulse(CH["R_SIDE_MARKER"], f, hold_ms=80)
+            else:
+                # build / climax — medium intensity, follow strength
+                if hit_strength < 0.45:
+                    continue
+                # Pick a channel based on pan_bass so stereo hits fire the
+                # correct side of the car.
+                fi = min(len(self.pan_bass) - 1, f)
+                pan = self.pan_bass[fi] if fi < len(self.pan_bass) else 0.0
+                if pan < -0.2:
+                    ch = CH["L_OUTER_BEAM"]
+                elif pan > 0.2:
+                    ch = CH["R_OUTER_BEAM"]
+                else:
+                    ch = CH["L_OUTER_BEAM"] if (f // 30) % 2 == 0 else CH["R_OUTER_BEAM"]
+                self.pulse(ch, f, hold_ms=60, level=255)
+                # Climax bonus: also hit signature on strong onsets
+                if section == "climax" and hit_strength > 0.7:
+                    side_sig = CH["L_SIGNATURE"] if ch == CH["L_OUTER_BEAM"] else CH["R_SIGNATURE"]
+                    self.pulse(side_sig, f, hold_ms=60)
+
+    def _outro_burst_layer(self):
+        """Detect an energetic outro (drum roll, final blast, crescendo) and
+        fire EVERY front and rear light simultaneously through it.
+
+        Stairway's outro: after the quiet bridge, there's a final drum roll
+        that deserves all-lights-blinking-like-crazy energy. Detect this by
+        scanning the last 20% of the music region for a window where BOTH
+        rms AND perc_onset density stay elevated for >= 2 seconds.
+
+        If found, emit a high-intensity blast across every front and rear
+        light for the duration of the burst. Works alongside the onset
+        layer which fires individual hits within it.
+        """
+        import numpy as np
+        music_n = self.music_end - self.music_start
+        if music_n < ms_to_frames(1000, self.STEP_MS):
+            return  # less than 1 s of music — nothing to do
+        # scan last 25% of the music region so we catch the final build-up
+        # even on long songs with a pre-outro quiet bridge (Stairway).
+        scan_start = self.music_start + int(music_n * 0.75)
+        scan_end = self.music_end
+
+        rms = np.asarray(self.rms, dtype=np.float32)[scan_start:scan_end]
+        # perc_onset per frame — need the array from analysis
+        perc = np.asarray(self.a.get("perc_onset", self.rms), dtype=np.float32)
+        perc = perc[scan_start:scan_end]
+        if len(rms) < ms_to_frames(2000, self.STEP_MS):
+            return
+
+        # 1-second rolling averages
+        k = max(1, ms_to_frames(1000, self.STEP_MS))
+        kernel = np.ones(k, dtype=np.float32) / k
+        rms_smooth = np.convolve(rms, kernel, mode="same")
+        perc_smooth = np.convolve(perc, kernel, mode="same")
+
+        # Thresholds: above the 60th percentile of the full song. Lower than
+        # before so we catch the "build-up to the final note" even when it
+        # hasn't yet reached the song's peak RMS. The strobe pattern itself
+        # is dramatic so we err on the side of "fire it" whenever the outro
+        # is clearly energetic.
+        rms_thresh = float(np.percentile(self.rms, 60))
+        perc_thresh = float(np.percentile(self.a.get("perc_onset", self.rms), 65))
+
+        # Find contiguous windows where both are hot for >= 2 s. We take the
+        # LAST qualifying burst, not the longest — because the classic
+        # "outro drum roll" is the final high-energy chunk before the song
+        # ends (Stairway's pattern: big chorus → quiet bridge → FINAL
+        # CRESCENDO → song ends). Picking by "longest" would anchor on the
+        # big chorus and miss the actual drum roll.
+        hot = (rms_smooth > rms_thresh) & (perc_smooth > perc_thresh)
+        hold = ms_to_frames(2000, self.STEP_MS)
+        bursts = []
+        current = None
+        for i, h in enumerate(hot):
+            if h:
+                if current is None:
+                    current = i
+            else:
+                if current is not None and i - current >= hold:
+                    bursts.append((current, i))
+                current = None
+        if current is not None and len(hot) - current >= hold:
+            bursts.append((current, len(hot)))
+
+        if not bursts:
+            return
+        burst_start, burst_end = bursts[-1]  # the LAST burst wins
+
+        # Translate back to absolute frames and write the blast.
+        abs_start = scan_start + burst_start
+        abs_end = scan_start + burst_end
+
+        full_fronts = [
+            CH["L_OUTER_BEAM"], CH["R_OUTER_BEAM"],
+            CH["L_INNER_BEAM"], CH["R_INNER_BEAM"],
+            CH["L_SIGNATURE"], CH["R_SIGNATURE"],
+            CH["L_CH4"], CH["R_CH4"], CH["L_CH5"], CH["R_CH5"],
+            CH["L_CH6"], CH["R_CH6"],
+            CH["L_FRONT_TURN"], CH["R_FRONT_TURN"],
+            CH["L_FRONT_FOG"], CH["R_FRONT_FOG"],
+            CH["L_AUX_PARK"], CH["R_AUX_PARK"],
+            CH["L_SIDE_MARKER"], CH["R_SIDE_MARKER"],
+            CH["L_SIDE_REPEATER"], CH["R_SIDE_REPEATER"],
+        ]
+        full_rears = [
+            CH["BRAKE"], CH["L_TAIL"], CH["R_TAIL"], CH["REVERSE"],
+            CH["REAR_FOG"], CH["LICENSE"],
+            CH["L_REAR_TURN"], CH["R_REAR_TURN"],
+        ]
+        # Strobe pattern inside the burst: all lights on during the "hot"
+        # pulses, off between them. Use the onset signal itself as the gate
+        # so the strobe *feels* the drum roll instead of a blind 10 Hz strobe.
+        strobe_on_frames = ms_to_frames(60, self.STEP_MS)
+        strobe_off_frames = ms_to_frames(60, self.STEP_MS)
+        period = strobe_on_frames + strobe_off_frames
+        for base in range(abs_start, min(abs_end, self.n), period):
+            for f in range(base, min(base + strobe_on_frames, self.n)):
+                for c in full_fronts + full_rears:
+                    self.w.set(f, c, 255)
+
+        # End of burst: hard blackout for 400 ms to emphasize the final note
+        blackout_end = min(self.n, abs_end + ms_to_frames(400, self.STEP_MS))
+        for f in range(abs_end, blackout_end):
+            for c in full_fronts + full_rears:
+                self.w.set(f, c, 0)
+
+    def _mute_non_music_region(self):
+        """Zero out every channel before music_start and after music_end.
+        Keeps the car completely dark during applause / MC announcements.
+        Runs LAST in the compose pipeline so it overrides every other layer.
+        """
+        if self.music_start <= 0 and self.music_end >= self.n:
+            return  # nothing to trim
+        if self.music_start > 0:
+            for f in range(0, min(self.music_start, self.n)):
+                for ci in range(1, self.channels + 1):
+                    self.w.set(f, ci, 0)
+        if self.music_end < self.n:
+            for f in range(max(0, self.music_end), self.n):
+                for ci in range(1, self.channels + 1):
+                    self.w.set(f, ci, 0)
 
     def _interior_layer(self):
         """Interior RGB + (Cybertruck only) light-bar effects.
