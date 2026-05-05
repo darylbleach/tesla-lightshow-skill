@@ -173,6 +173,13 @@ class Composer:
         self.chroma = analysis.get("chroma", None)  # list of 12-element lists or None
         self.key_tonic = analysis.get("key_tonic", [0] * n)
         self.key_mode = analysis.get("key_mode", [1] * n)  # default major
+        # Per-frame tempo for songs that accelerate / decelerate (Stairway-
+        # style). Falls back to a constant array if tempo_curve isn't
+        # present in the analysis (backward compat).
+        self.tempo_curve = analysis.get(
+            "tempo_curve", [self.tempo] * n
+        )
+        self.tempo_change_points = analysis.get("tempo_change_points", [])
 
         # Channel count per model:
         #   * Cybertruck: 200 (needs light bars + interior RGB).
@@ -280,6 +287,37 @@ class Composer:
         # Hold peak briefly past the beat for a clean "landing" then off.
         peak_end = beat + ms_to_frames(max(tail_ms, self.STEP_MS), self.STEP_MS)
         self.w.set_range(start, peak_end, ch, level)
+
+    def local_bpm(self, frame: int) -> float:
+        """Return the per-frame BPM estimate, clamped to a safe range.
+
+        Songs like Stairway to Heaven accelerate from ~72 to ~98 BPM; this
+        lets layers scale ramp durations to the *current* tempo rather than
+        the whole-song median.
+        """
+        if 0 <= frame < len(self.tempo_curve):
+            return max(40.0, min(220.0, float(self.tempo_curve[frame])))
+        return max(40.0, min(220.0, float(self.tempo)))
+
+    def tempo_ramp_choice(self, frame: int) -> str:
+        """Pick a ramp duration class appropriate for the current tempo.
+
+        Slow songs (< 70 BPM → beat > 857 ms) can sustain 2000 ms ramps
+        without stepping on the next beat. Fast songs need tight 500 ms
+        ramps. Between those, 1000 ms is the sweet spot.
+
+        Returns one of the ramp keys accepted by ramp_pulse / ramp_to_beat:
+        "500", "1000", or "2000".
+        """
+        bpm = self.local_bpm(frame)
+        beat_ms = 60_000.0 / bpm
+        # Use ≤ 65% of the beat so ramp finishes well before the next hit.
+        budget = 0.65 * beat_ms
+        if budget >= 2000:
+            return "2000"
+        if budget >= 1000:
+            return "1000"
+        return "500"
 
     def ramp_on_off(self, ch: int, frame: int, on_dur_ms: int, off_dur_ms: int, peak_hold_ms: int):
         """Ramp a channel up, hold, then ramp down (nice breathing effect)."""
@@ -483,6 +521,19 @@ class Composer:
             self.intro_end = int(n * 0.15)
             self.build_end = int(n * 0.55)
             self.climax_end = int(n * 0.85)
+
+        # Tempo change points can also pull the intro/build boundary — a
+        # sustained tempo shift is a structural cue that often aligns with
+        # the end of an intro or the start of a build (e.g. Stairway's 72 →
+        # 84 BPM transition when the drums enter). If there's a tempo shift
+        # inside the intro region, respect it.
+        for cp in self.tempo_change_points:
+            if cp < self.intro_end and cp > n // 20:
+                # Tempo shifted during the intro — move the intro end there
+                self.intro_end = cp
+                if self.build_end < cp:
+                    self.build_end = min(n - 1, cp + n // 10)
+                break
 
         # Guarantee sane ordering even on edge cases
         self.intro_end = max(0, min(self.intro_end, n - 1))
@@ -702,14 +753,25 @@ class Composer:
             if section == "intro":
                 # Beat-aligned swell: ramp PEAKS on the beat (not starts on it),
                 # so the eye's perceived-onset lands on the downbeat.
+                # Tempo-aware: slow songs (Stairway intro @ 72 BPM) can hold
+                # a 2000 ms ramp; fast songs get tighter 500 ms ramps so
+                # they don't smear into the next beat.
+                intro_ramp = self.tempo_ramp_choice(beat)
                 if alt % 2 == 0:
-                    self.ramp_to_beat(CH["L_OUTER_BEAM"], beat, "1000", tail_ms=80)
+                    self.ramp_to_beat(CH["L_OUTER_BEAM"], beat, intro_ramp, tail_ms=80)
                 else:
-                    self.ramp_to_beat(CH["R_OUTER_BEAM"], beat, "1000", tail_ms=80)
+                    self.ramp_to_beat(CH["R_OUTER_BEAM"], beat, intro_ramp, tail_ms=80)
             elif section == "outro":
                 # Long breathing swell that peaks on the beat, both sides.
-                self.ramp_to_beat(CH["L_OUTER_BEAM"], beat, "2000", tail_ms=120)
-                self.ramp_to_beat(CH["R_OUTER_BEAM"], beat, "2000", tail_ms=120)
+                # Outro prefers the longest ramp that fits the current tempo.
+                outro_ramp = self.tempo_ramp_choice(beat)
+                # For the outro specifically, try one notch longer (even
+                # breathier) if there's enough beat budget, since ramp_to_beat
+                # already auto-shrinks if it can't fit.
+                upgrade = {"500": "1000", "1000": "2000", "2000": "2000"}
+                outro_ramp = upgrade[outro_ramp]
+                self.ramp_to_beat(CH["L_OUTER_BEAM"], beat, outro_ramp, tail_ms=120)
+                self.ramp_to_beat(CH["R_OUTER_BEAM"], beat, outro_ramp, tail_ms=120)
             else:
                 # build / climax — full beat logic
                 # Heavy = strong beat OR loud frame OR big percussive onset.

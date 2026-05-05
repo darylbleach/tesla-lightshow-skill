@@ -328,6 +328,15 @@ def analyze(L: np.ndarray, R: np.ndarray, sr: int):
     meter = beat_data["meter"]  # 3 or 4 for 3/4 or 4/4
     agreement_pct = beat_data["agreement_pct"]
 
+    # --- tempo curve (track tempo changes over time) -----------------------
+    # The single tempo_bpm number is the global median, which fails on songs
+    # that accelerate (Stairway's 72 → 84 → 98 BPM) or slow down. We post-
+    # process the detected beats to produce a per-frame tempo curve and
+    # pick out sustained tempo shifts > 8% as change points.
+    tempo_curve, tempo_change_points = compute_tempo_curve(
+        beat_frames, n_frames, hop, sr, tempo_bpm
+    )
+
     # --- drops --------------------------------------------------------------
     drops = detect_drops(rms_n)
 
@@ -388,6 +397,8 @@ def analyze(L: np.ndarray, R: np.ndarray, sr: int):
         "analyzer": analyzer_stack[0],  # backward compat
         "analyzer_stack": analyzer_stack,
         "tempo_bpm": float(tempo_bpm),
+        "tempo_curve": tempo_curve.tolist(),
+        "tempo_change_points": [int(p) for p in tempo_change_points],
         "meter": int(meter),
         "beat_agreement_pct": float(agreement_pct),
         "rms": rms_n.tolist(),
@@ -705,6 +716,118 @@ def dual_tracker_beats(L, R, sr, hop, n_frames, perc_onset):
 
 
 # ---------------------------------------------------------------------------
+# Tempo curve (per-frame tempo, detects tempo drift / accelerandos)
+# ---------------------------------------------------------------------------
+
+def compute_tempo_curve(beat_frames, n_frames, hop, sr, fallback_bpm):
+    """Produce a per-frame tempo estimate plus sustained-change points.
+
+    Problem: a single tempo_bpm number is the median across the whole song,
+    which loses 72→84→98 BPM accelerandos (Stairway to Heaven, ballads that
+    build up, bolero-style crescendos). Post-processing the detected beats
+    gives us a local tempo without rerunning the tracker.
+
+    Approach:
+      1. Turn beat_frames into inter-beat intervals (IBI, one per pair).
+      2. For each frame, take the median IBI of beats in a ±5 s window
+         (=~10 beats at 120 BPM). Convert to BPM.
+      3. Smooth with a 2 s rolling mean to kill outliers.
+      4. Find tempo change points where the smoothed curve jumps by >8%
+         relative to the previous plateau for at least 5 s.
+
+    Returns:
+        tempo_curve (np.float32[n_frames]) — per-frame BPM estimate
+        change_points (list[int])        — frame indices of sustained shifts
+    """
+    frame_sr = sr / hop
+    curve = np.full(n_frames, float(fallback_bpm), dtype=np.float32)
+
+    if len(beat_frames) < 4:
+        # Not enough beats to estimate a curve. Return flat.
+        return curve, []
+
+    beats = sorted(set(int(b) for b in beat_frames if 0 <= b < n_frames))
+    if len(beats) < 4:
+        return curve, []
+
+    # Instantaneous BPM at each beat (from inter-beat interval)
+    ibi = np.diff(beats).astype(np.float32)  # frames
+    ibi_sec = ibi / frame_sr
+    # Clamp to sensible range so one huge gap doesn't skew things
+    ibi_sec = np.clip(ibi_sec, 60.0 / 240.0, 60.0 / 30.0)
+    bpm_at_beat = 60.0 / ibi_sec  # length = len(beats) - 1
+
+    # For each beat midpoint, assign the BPM we just computed.
+    # Then fill the curve by finding, per-frame, the median of nearby beats.
+    # ±5 s window = frame_sr * 5 on each side.
+    half_window_frames = int(5.0 * frame_sr)
+
+    # Walk frames in chunks: since beats are sparse, use bisect logic.
+    import bisect
+    # midpoints between adjacent beats give us where each BPM value "lives"
+    mid_frames = [(beats[i] + beats[i + 1]) // 2 for i in range(len(beats) - 1)]
+    for f in range(n_frames):
+        lo = bisect.bisect_left(mid_frames, f - half_window_frames)
+        hi = bisect.bisect_right(mid_frames, f + half_window_frames)
+        if hi > lo:
+            curve[f] = float(np.median(bpm_at_beat[lo:hi]))
+        # else: leave at fallback_bpm
+
+    # Edge-of-song fade-in/out: the first/last ~3 s often get only 1-2
+    # beats into the median window and produce outliers. Clamp by inheriting
+    # from slightly further in.
+    edge_frames = int(3.0 * frame_sr)
+    if n_frames > 2 * edge_frames:
+        curve[:edge_frames] = curve[edge_frames]
+        curve[-edge_frames:] = curve[-edge_frames - 1]
+
+    # Robust outlier clip: any value > 1.5x or < 0.5x the global median is
+    # almost certainly a tracker glitch (missed beats → double IBI → half
+    # BPM; double beats → half IBI → double BPM). Replace outliers with
+    # the local non-outlier median.
+    global_median = float(np.median(curve))
+    lo_bound = global_median * 0.5
+    hi_bound = global_median * 1.5
+    outlier = (curve < lo_bound) | (curve > hi_bound)
+    if outlier.any() and (~outlier).any():
+        # Replace with nearest valid value (forward-fill then back-fill)
+        valid_indices = np.where(~outlier)[0]
+        for idx in np.where(outlier)[0]:
+            nearest = valid_indices[np.argmin(np.abs(valid_indices - idx))]
+            curve[idx] = curve[nearest]
+
+    # 2 s rolling mean for smoothing
+    smooth_len = max(1, int(2.0 * frame_sr))
+    if smooth_len > 1 and n_frames > smooth_len:
+        kernel = np.ones(smooth_len, dtype=np.float32) / smooth_len
+        curve = np.convolve(curve, kernel, mode="same")
+
+    # Detect sustained change points: walk the smoothed curve, compare each
+    # frame to the median of the previous ~5 s plateau, and flag when the
+    # ratio exits [0.92, 1.08] for at least 5 s continuously.
+    change_points = []
+    plateau_len = int(5.0 * frame_sr)
+    if n_frames > 2 * plateau_len:
+        # Seed with the first plateau's median
+        prev_median = float(np.median(curve[:plateau_len]))
+        i = plateau_len
+        while i < n_frames - plateau_len:
+            window = curve[i : i + plateau_len]
+            ratio = float(np.median(window)) / (prev_median + 1e-9)
+            if ratio < 0.92 or ratio > 1.08:
+                # Confirm sustained — require the ratio to hold for the full window
+                low, high = window.min(), window.max()
+                if low / (prev_median + 1e-9) > 0.85 and high / (prev_median + 1e-9) < 1.20:
+                    change_points.append(int(i))
+                    prev_median = float(np.median(window))
+                    i += plateau_len
+                    continue
+            i += plateau_len // 2
+
+    return curve, change_points
+
+
+# ---------------------------------------------------------------------------
 # Structural segmentation (replace hardcoded 15/55/85% narrative arc)
 # ---------------------------------------------------------------------------
 
@@ -941,12 +1064,22 @@ def main():
         f"{s['label']}({(s['end']-s['start'])*FRAME_MS/1000:.0f}s)"
         for s in analysis.get("segments", [])
     ) or "no segments"
+    tempo_curve = analysis.get("tempo_curve", [])
+    if tempo_curve:
+        t_min = min(tempo_curve)
+        t_max = max(tempo_curve)
+        tempo_range = f"(range {t_min:.0f}–{t_max:.0f})" if (t_max - t_min) > 5 else ""
+    else:
+        tempo_range = ""
+    n_change = len(analysis.get("tempo_change_points", []))
     print(
         f"Analyzed {wav.name}: {dur:.1f}s, {analysis['n_frames']} frames, "
-        f"tempo ≈ {analysis['tempo_bpm']:.1f} BPM, meter {analysis.get('meter',4)}/4, "
+        f"tempo ≈ {analysis['tempo_bpm']:.1f} BPM{tempo_range}, "
+        f"meter {analysis.get('meter',4)}/4, "
         f"{len(analysis['beat_frames'])} beats "
         f"({analysis.get('beat_agreement_pct',0):.0f}% tracker agreement), "
         f"{len(analysis.get('downbeat_frames', []))} downbeats, "
+        f"{n_change} tempo change{'s' if n_change != 1 else ''}, "
         f"{len(analysis['drop_frames'])} drops, "
         f"stereo_width≈{stereo_mean:.2f}, "
         f"analyzers={stack}"
