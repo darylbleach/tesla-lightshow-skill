@@ -179,7 +179,7 @@ Full tables are in `references/channel_map.md` and `references/model_capabilitie
 - **Audio-detected drops outside climax** → Mini front-light blast, no closures (stays subordinate to the climax).
 - **Brightness / spectral centroid** → Hue mapping for interior RGB (warm when dark, cool when bright).
 - **Yellow blinker layer** — front turn signals alternate L↔R on 2× beat subdivisions in build, 4× in climax (the signature "yellow blinker" pattern).
-- **Narrative arc** — intro (0–15%) soft outer-beam ramps only; build (15–55%) every-other-beat; climax (55–85%) full density; outro (85–100%) long 2 s breathing ramps.
+- **Narrative arc** — intro (0–15%) soft outer-beam ramps only; build (15–55%) every-other-beat; climax (55–85%) full density; **no outro** — post-climax beat/ramp/onset lights stay off and the show ends with the music (everything is muted after `music_end`).
 - Use ramping variants (70/80/90%) on Model 3 / Y / Cybertruck where smooth fades read better than boolean snaps.
 
 ## Model-specific reminders

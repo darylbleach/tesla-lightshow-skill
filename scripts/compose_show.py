@@ -476,13 +476,13 @@ class Composer:
         self._stereo_wash_layer()
         self._beat_layer()
         self._onset_layer()
-        self._outro_burst_layer()
         self._climax_choreography()
         self._drop_layer()
         self._interior_layer()
         # LAST: zero out everything before music_start and after music_end so
         # the car stays dark during applause / MC announcements / silent
-        # lead-ins. Runs after all other layers so every other layer can be
+        # lead-ins, and the show ends exactly when the music does (no outro,
+        # no trailer). Runs after all other layers so every other layer can be
         # written freely and this is the final authority on "no lights".
         self._mute_non_music_region()
 
@@ -495,8 +495,9 @@ class Composer:
           segments with labels (intro/verse/chorus/bridge/outro), we use
           them directly. The climax lives in the highest-energy chorus
           section; everything before it is intro/build; everything after
-          is outro. This means the big moment lands on the song's actual
-          peak, not a time-based proxy.
+          is "post" (no beat/ramp/onset lights — there is no outro act).
+          This means the big moment lands on the song's actual peak, not
+          a time-based proxy.
 
         * **Legacy fallback** — older analysis JSON without segments uses
           the original 15/55/85% split based on time.
@@ -512,7 +513,7 @@ class Composer:
 
         if segments:
             # Pick the climax = highest-energy chorus (fallback: highest
-            # energy overall). Surrounding segments become intro/build/outro.
+            # energy overall). Surrounding segments become intro/build/post.
             chorus_segs = [s for s in segments if s["label"] == "chorus"]
             pool = chorus_segs if chorus_segs else segments
             climax_seg = max(pool, key=lambda s: s["energy"])
@@ -534,6 +535,8 @@ class Composer:
             self.intro_end = int(n * 0.15)
             self.build_end = int(n * 0.55)
             self.climax_end = int(n * 0.85)
+        # Frames at/after climax_end are "post": the show has no outro, so
+        # the beat / ramp / onset / blinker layers stay silent there.
 
         # Tempo change points can also pull the intro/build boundary — a
         # sustained tempo shift is a structural cue that often aligns with
@@ -571,7 +574,7 @@ class Composer:
             return "build"
         if f < self.climax_end:
             return "climax"
-        return "outro"
+        return "post"
 
     def _section_intensity(self, f: int) -> float:
         """Multiplier 0..1 that scales how intense the beat layer is."""
@@ -585,9 +588,8 @@ class Composer:
             return 0.5 + 0.4 * frac
         if s == "climax":
             return 1.0
-        # outro — calm down 0.9 → 0.2
-        frac = (f - self.climax_end) / max(1, self.n - self.climax_end)
-        return 0.9 - 0.7 * frac
+        # post-climax: no outro, nothing to scale
+        return 0.0
 
     def _baseline(self):
         """Intentionally empty — previous always-on inner-beam glow was washing
@@ -649,8 +651,9 @@ class Composer:
                 continue
             # Subdivision count per beat: intro 0, build 1 (on-beat only),
             # climax 3 (three blinks per beat). Previously build=2 and
-            # climax=4 was too constant and washed out contrast.
-            subdivs = {"build": 1, "climax": 2, "outro": 0}.get(section, 0)
+            # climax=4 was too constant and washed out contrast. Post-climax
+            # frames get 0 — no outro blinking.
+            subdivs = {"build": 1, "climax": 2}.get(section, 0)
             if subdivs == 0:
                 continue
             beat_len = b1 - b0
@@ -740,13 +743,15 @@ class Composer:
         * intro: sparse; only ~every 4th beat, ramping not instant
         * build: every 2nd beat; mix of ramps and pulses
         * climax: every beat, full intensity, kick/snare differentiated
-        * outro: every 4th beat, very soft ramps only
+        * post-climax: nothing (no outro — the show ends with the music)
         """
         alt = 0
         for idx, beat in enumerate(self.beats):
             if beat >= self.n:
                 break
             section = self._section(beat)
+            if section == "post":
+                break  # beats are ascending; everything after is post too
             strong = beat in self.strong
             bi = min(len(self.rms) - 1, beat)
             rms = self.rms[bi]
@@ -757,8 +762,6 @@ class Composer:
 
             # skip-rate per section
             if section == "intro" and (idx % 4) != 0:
-                continue
-            if section == "outro" and (idx % 4) != 0:
                 continue
             if section == "build" and (idx % 2) != 0 and not strong:
                 continue
@@ -774,17 +777,6 @@ class Composer:
                     self.ramp_to_beat(CH["L_OUTER_BEAM"], beat, intro_ramp, tail_ms=80)
                 else:
                     self.ramp_to_beat(CH["R_OUTER_BEAM"], beat, intro_ramp, tail_ms=80)
-            elif section == "outro":
-                # Long breathing swell that peaks on the beat, both sides.
-                # Outro prefers the longest ramp that fits the current tempo.
-                outro_ramp = self.tempo_ramp_choice(beat)
-                # For the outro specifically, try one notch longer (even
-                # breathier) if there's enough beat budget, since ramp_to_beat
-                # already auto-shrinks if it can't fit.
-                upgrade = {"500": "1000", "1000": "2000", "2000": "2000"}
-                outro_ramp = upgrade[outro_ramp]
-                self.ramp_to_beat(CH["L_OUTER_BEAM"], beat, outro_ramp, tail_ms=120)
-                self.ramp_to_beat(CH["R_OUTER_BEAM"], beat, outro_ramp, tail_ms=120)
             else:
                 # build / climax — full beat logic
                 # Heavy = strong beat OR loud frame OR big percussive onset.
@@ -1024,7 +1016,7 @@ class Composer:
                 d, d + ms_to_frames(6000, self.STEP_MS), style="curtain"
             )
 
-        # Close the liftgate late in the climax so it's back down for outro.
+        # Close the liftgate late in the climax so it's back down before the song ends.
         close_gate = min(self.n - 1, self.climax_end - ms_to_frames(4000, self.STEP_MS))
         self.closure(CH["LIFTGATE"], close_gate, "close", hold_ms=300,
                      budget_key="liftgate", limit=5)
@@ -1067,8 +1059,8 @@ class Composer:
         where grid-based beat tracking breaks down.
 
         Intensity follows the section arc — intros get soft outer-beam
-        sparkles, choruses get full-front hits, the outro goes wild if the
-        song's outro is percussively active.
+        sparkles, choruses get full-front hits. Post-climax onsets are
+        ignored: there is no outro act.
         """
         if not self.onset_frames:
             return
@@ -1100,22 +1092,8 @@ class Composer:
                     continue
                 ch = CH["L_OUTER_BEAM"] if (f // 50) % 2 == 0 else CH["R_OUTER_BEAM"]
                 self.pulse(ch, f, hold_ms=40, level=180)
-            elif section == "outro":
-                # OUTRO ONSETS RUN FULL INTENSITY (handles outro drum rolls)
-                if hit_strength < 0.35:
-                    continue
-                # Fire alternating front beams + signature + a side marker
-                use_left = (f // 40) % 2 == 0
-                if use_left:
-                    self.pulse(CH["L_OUTER_BEAM"], f, hold_ms=80)
-                    self.pulse(CH["L_INNER_BEAM"], f, hold_ms=80)
-                    self.pulse(CH["L_SIGNATURE"], f, hold_ms=80)
-                    self.pulse(CH["L_SIDE_MARKER"], f, hold_ms=80)
-                else:
-                    self.pulse(CH["R_OUTER_BEAM"], f, hold_ms=80)
-                    self.pulse(CH["R_INNER_BEAM"], f, hold_ms=80)
-                    self.pulse(CH["R_SIGNATURE"], f, hold_ms=80)
-                    self.pulse(CH["R_SIDE_MARKER"], f, hold_ms=80)
+            elif section == "post":
+                continue  # no outro
             else:
                 # build / climax — medium intensity, follow strength
                 if hit_strength < 0.45:
@@ -1135,112 +1113,6 @@ class Composer:
                 if section == "climax" and hit_strength > 0.7:
                     side_sig = CH["L_SIGNATURE"] if ch == CH["L_OUTER_BEAM"] else CH["R_SIGNATURE"]
                     self.pulse(side_sig, f, hold_ms=60)
-
-    def _outro_burst_layer(self):
-        """Detect an energetic outro (drum roll, final blast, crescendo) and
-        fire EVERY front and rear light simultaneously through it.
-
-        Stairway's outro: after the quiet bridge, there's a final drum roll
-        that deserves all-lights-blinking-like-crazy energy. Detect this by
-        scanning the last 20% of the music region for a window where BOTH
-        rms AND perc_onset density stay elevated for >= 2 seconds.
-
-        If found, emit a high-intensity blast across every front and rear
-        light for the duration of the burst. Works alongside the onset
-        layer which fires individual hits within it.
-        """
-        import numpy as np
-        music_n = self.music_end - self.music_start
-        if music_n < ms_to_frames(1000, self.STEP_MS):
-            return  # less than 1 s of music — nothing to do
-        # scan last 25% of the music region so we catch the final build-up
-        # even on long songs with a pre-outro quiet bridge (Stairway).
-        scan_start = self.music_start + int(music_n * 0.75)
-        scan_end = self.music_end
-
-        rms = np.asarray(self.rms, dtype=np.float32)[scan_start:scan_end]
-        # perc_onset per frame — need the array from analysis
-        perc = np.asarray(self.a.get("perc_onset", self.rms), dtype=np.float32)
-        perc = perc[scan_start:scan_end]
-        if len(rms) < ms_to_frames(2000, self.STEP_MS):
-            return
-
-        # 1-second rolling averages
-        k = max(1, ms_to_frames(1000, self.STEP_MS))
-        kernel = np.ones(k, dtype=np.float32) / k
-        rms_smooth = np.convolve(rms, kernel, mode="same")
-        perc_smooth = np.convolve(perc, kernel, mode="same")
-
-        # Thresholds: above the 60th percentile of the full song. Lower than
-        # before so we catch the "build-up to the final note" even when it
-        # hasn't yet reached the song's peak RMS. The strobe pattern itself
-        # is dramatic so we err on the side of "fire it" whenever the outro
-        # is clearly energetic.
-        rms_thresh = float(np.percentile(self.rms, 60))
-        perc_thresh = float(np.percentile(self.a.get("perc_onset", self.rms), 65))
-
-        # Find contiguous windows where both are hot for >= 2 s. We take the
-        # LAST qualifying burst, not the longest — because the classic
-        # "outro drum roll" is the final high-energy chunk before the song
-        # ends (Stairway's pattern: big chorus → quiet bridge → FINAL
-        # CRESCENDO → song ends). Picking by "longest" would anchor on the
-        # big chorus and miss the actual drum roll.
-        hot = (rms_smooth > rms_thresh) & (perc_smooth > perc_thresh)
-        hold = ms_to_frames(2000, self.STEP_MS)
-        bursts = []
-        current = None
-        for i, h in enumerate(hot):
-            if h:
-                if current is None:
-                    current = i
-            else:
-                if current is not None and i - current >= hold:
-                    bursts.append((current, i))
-                current = None
-        if current is not None and len(hot) - current >= hold:
-            bursts.append((current, len(hot)))
-
-        if not bursts:
-            return
-        burst_start, burst_end = bursts[-1]  # the LAST burst wins
-
-        # Translate back to absolute frames and write the blast.
-        abs_start = scan_start + burst_start
-        abs_end = scan_start + burst_end
-
-        full_fronts = [
-            CH["L_OUTER_BEAM"], CH["R_OUTER_BEAM"],
-            CH["L_INNER_BEAM"], CH["R_INNER_BEAM"],
-            CH["L_SIGNATURE"], CH["R_SIGNATURE"],
-            CH["L_CH4"], CH["R_CH4"], CH["L_CH5"], CH["R_CH5"],
-            CH["L_CH6"], CH["R_CH6"],
-            CH["L_FRONT_TURN"], CH["R_FRONT_TURN"],
-            CH["L_FRONT_FOG"], CH["R_FRONT_FOG"],
-            CH["L_AUX_PARK"], CH["R_AUX_PARK"],
-            CH["L_SIDE_MARKER"], CH["R_SIDE_MARKER"],
-            CH["L_SIDE_REPEATER"], CH["R_SIDE_REPEATER"],
-        ]
-        full_rears = [
-            CH["BRAKE"], CH["L_TAIL"], CH["R_TAIL"], CH["REVERSE"],
-            CH["REAR_FOG"], CH["LICENSE"],
-            CH["L_REAR_TURN"], CH["R_REAR_TURN"],
-        ]
-        # Strobe pattern inside the burst: all lights on during the "hot"
-        # pulses, off between them. Use the onset signal itself as the gate
-        # so the strobe *feels* the drum roll instead of a blind 10 Hz strobe.
-        strobe_on_frames = ms_to_frames(60, self.STEP_MS)
-        strobe_off_frames = ms_to_frames(60, self.STEP_MS)
-        period = strobe_on_frames + strobe_off_frames
-        for base in range(abs_start, min(abs_end, self.n), period):
-            for f in range(base, min(base + strobe_on_frames, self.n)):
-                for c in full_fronts + full_rears:
-                    self.w.set(f, c, 255)
-
-        # End of burst: hard blackout for 400 ms to emphasize the final note
-        blackout_end = min(self.n, abs_end + ms_to_frames(400, self.STEP_MS))
-        for f in range(abs_end, blackout_end):
-            for c in full_fronts + full_rears:
-                self.w.set(f, c, 0)
 
     def _mute_non_music_region(self):
         """Zero out every channel before music_start and after music_end.

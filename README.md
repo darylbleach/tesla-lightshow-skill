@@ -27,9 +27,10 @@ Other show generators pick beats and flash lights. This one treats the show as a
 three-act piece:
 
 - **Narrative arc** — every show has an intro (quiet), build (ramping density),
-  climax (full intensity + physical movement), and outro (calm fade). The climax
-  always lands on the loudest sustained moment of the song, so the dramatic
-  reveal actually lines up with the music.
+  and climax (full intensity + physical movement). There is no outro: after the
+  climax the beat/ramp/onset lights stay off, and everything is muted at the end
+  of the music. The climax always lands on the loudest sustained moment of the
+  song, so the dramatic reveal actually lines up with the music.
 - **Physical choreography at the climax** — liftgate pre-opens 14 s early,
   mirrors flap in a continuous wiper pattern, charge port does the rainbow
   Dance, and model-specific tricks fire (Model S door handles; Model X falcon
@@ -165,7 +166,7 @@ song.wav
 │  ┌──────────────────────────────────────┐              │
 │  │ Section planner                      │              │
 │  │  intro 0-15% / build 15-55% /        │              │
-│  │  climax 55-85% / outro 85-100%       │              │
+│  │  climax 55-85% / no outro (dark)     │              │
 │  └──────────────────────────────────────┘              │
 │                                                        │
 │  Layers (stacked, written into the same FSEQ frames):  │
